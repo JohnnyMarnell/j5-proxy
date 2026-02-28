@@ -5,6 +5,7 @@ import { chromium } from 'playwright-extra';
 import stealth from 'puppeteer-extra-plugin-stealth';
 import { execSync } from 'child_process';
 import { parseArgs } from 'node:util';
+import { appendFileSync } from 'node:fs';
 
 // --- DEBOUNCED CLEANUP ERROR LOGGING ---
 let cleanupErrorCount = 0;
@@ -25,19 +26,32 @@ function logCleanupError() {
 const { values } = parseArgs({
     options: {
         port: { type: 'string', short: 'p', default: '8787' },
-        ttl: { type: 'string', short: 't', default: '3600000' }, // Default cache TTL: 1 hour (in ms)
+        ttl: { type: 'string', short: 't', default: '3600000' },
+        'log-html': { type: 'boolean', default: false },
+        'log-file': { type: 'string', default: '/tmp/proxy.jsonl' },
     }
 });
 
 const PORT = parseInt(values.port as string, 10);
 const COOKIE_CACHE_TTL = parseInt(values.ttl as string, 10);
+const GLOBAL_LOG_HTML = values['log-html'] as boolean;
+const LOG_FILE = values['log-file'] as string;
+
+// --- JSONL LOGGER ---
+function logToFile(entry: Record<string, any>) {
+    try {
+        appendFileSync(LOG_FILE, JSON.stringify(entry) + '\n');
+    } catch (e: any) {
+        console.error(`[!] Failed to write to ${LOG_FILE}: ${e.message}`);
+    }
+}
 
 // Apply stealth plugin
 chromium.use(stealth());
 
 const app = new Hono();
 
-let browser: any; 
+let browser: any;
 
 // --- COOKIE CACHING STATE ---
 let cachedCookies: any[] = [];
@@ -46,7 +60,7 @@ let lastCookieFetchTime: number = 0;
 // Helper function to get cookies (either from cache or by executing Python)
 function getCookies(): any[] {
     const now = Date.now();
-    
+
     // Return cached cookies if they exist and haven't expired
     if (cachedCookies.length > 0 && (now - lastCookieFetchTime < COOKIE_CACHE_TTL)) {
         return cachedCookies;
@@ -54,26 +68,22 @@ function getCookies(): any[] {
 
     console.log('[+] Cache expired or empty. Extracting fresh Chrome cookies via Python...');
     try {
-        // Execute the Python script synchronously
-        // Ensure cookies.py is in the same directory
         const pythonOutput = execSync('python cookies.py').toString();
-        
+
         const parsedCookies = JSON.parse(pythonOutput);
-        
+
         if (parsedCookies.error) {
             throw new Error(parsedCookies.error);
         }
 
-        // Update the cache
         cachedCookies = parsedCookies;
         lastCookieFetchTime = now;
-        
+
         console.log(`[+] Successfully extracted and cached ${cachedCookies.length} cookies.`);
         return cachedCookies;
     } catch (error: any) {
         console.error(`[!] Failed to extract cookies via Python: ${error.message}`);
-        // Fallback: return existing cached cookies if available, otherwise empty array
-        return cachedCookies; 
+        return cachedCookies;
     }
 }
 
@@ -84,10 +94,69 @@ async function initBrowser() {
     console.log('Browser ready.');
 }
 
+// --- X-Proxy-Options PARSING ---
+// Header format: X-Proxy-Options: render, log-html, wait=30000, selector=#content, settle=2000
+// Options:
+//   render           - Wait for full JS execution, return rendered DOM instead of first HTML response
+//   log-html         - Log HTML at each step to server output
+//   wait=<ms>        - Max wait time for render mode (default 20000)
+//   selector=<css>   - Wait for this CSS selector to appear before capturing DOM
+//   settle=<ms>      - Extra settle time after networkidle (default 1000)
+interface ProxyOptions {
+    render: boolean;
+    logHtml: boolean;
+    wait: number;
+    selector: string | null;
+    settle: number;
+}
+
+function parseProxyOptions(header: string | undefined): ProxyOptions {
+    const opts: ProxyOptions = {
+        render: false,
+        logHtml: GLOBAL_LOG_HTML,
+        wait: 20000,
+        selector: null,
+        settle: 1000,
+    };
+    if (!header) return opts;
+    const parts = header.split(',').map(s => s.trim());
+    for (const part of parts) {
+        const lower = part.toLowerCase();
+        if (lower === 'render') { opts.render = true; continue; }
+        if (lower === 'log-html') { opts.logHtml = true; continue; }
+        const [key, ...rest] = part.split('=');
+        const val = rest.join('='); // rejoin in case selector has = in it
+        switch (key.trim().toLowerCase()) {
+            case 'wait': opts.wait = parseInt(val, 10) || 20000; break;
+            case 'selector': opts.selector = val.trim(); break;
+            case 'settle': opts.settle = parseInt(val, 10) || 1000; break;
+        }
+    }
+    return opts;
+}
+
+function logHtmlStep(reqId: number, label: string, html: string, url: string, elapsedMs: number, reqHeaders: Record<string, string>, proxyOpts: ProxyOptions) {
+    const preview = html.length > 500 ? html.substring(0, 500) + `... (${html.length} chars total)` : html;
+    console.log(`\n[#${reqId} +${elapsedMs}ms HTML:${label}] ${url}\n${'─'.repeat(60)}\n${preview}\n${'─'.repeat(60)}`);
+    logToFile({
+        ts: new Date().toISOString(),
+        reqId,
+        elapsed: elapsedMs,
+        step: label,
+        request: { url, headers: reqHeaders, proxyOptions: proxyOpts },
+        response: { body: html, bodyLength: html.length },
+    });
+}
+
 // 2. Define the proxy route
+let requestCounter = 0;
+
 app.get('/*', async (c) => {
-    const path = c.req.path.substring(1); 
-    
+    const reqId = ++requestCounter;
+    const startTime = Date.now();
+    const elapsed = () => Date.now() - startTime;
+    const path = c.req.path.substring(1);
+
     if (!path || path === 'favicon.ico') {
         return c.text('Not found', 404);
     }
@@ -101,75 +170,180 @@ app.get('/*', async (c) => {
         return c.text('Invalid URL provided', 400);
     }
 
-    console.log(`[+] Scrape request: ${targetUrl}`);
+    const proxyOpts = parseProxyOptions(c.req.header('x-proxy-options'));
+
+    // Collect request headers for logging
+    const reqHeaders: Record<string, string> = {};
+    c.req.raw.headers.forEach((v, k) => { reqHeaders[k] = v; });
+
+    const tags = [
+        proxyOpts.render ? 'render' : null,
+        proxyOpts.logHtml ? 'log-html' : null,
+        proxyOpts.selector ? `selector=${proxyOpts.selector}` : null,
+    ].filter(Boolean);
+    console.log(`[#${reqId}] Scrape request: ${targetUrl}${tags.length ? ' [' + tags.join(', ') + ']' : ''}`);
 
     let context: any;
     let page: any;
+    let responseStatus = 200;
+    let responseBody = '';
+    let responseError: string | undefined;
+
     try {
-        // Fetch cookies (triggers Python script if cache is stale)
         const sessionCookies = getCookies();
 
         context = await browser.newContext({
             userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             viewport: { width: 1280, height: 720 }
         });
-        
-        // Inject the freshly decrypted or cached cookies into this specific context
+
         if (sessionCookies.length > 0) {
             await context.addCookies(sessionCookies);
         }
-        
+
         page = await context.newPage();
 
-        // --- THE ROBUST HTML INTERCEPTOR ---
-        const captureHtmlPromise = new Promise<string>((resolve) => {
-            page.on('response', async (response: any) => {
-                if (response.request().resourceType() === 'document' && response.request().frame() === page.mainFrame()) {
-                    try {
-                        const text = await response.text();
-                        
+        let rawHtml: string;
+        let firstResponseLogged = false;
+
+        // Single response listener shared by both modes.
+        // Always logs the first document response to JSONL immediately.
+        // In default mode, also resolves captureHtmlPromise.
+        let resolveCapture: ((html: string) => void) | null = null;
+        const captureHtmlPromise = new Promise<string>((resolve) => { resolveCapture = resolve; });
+
+        page.on('response', async (response: any) => {
+            if (response.request().resourceType() === 'document' && response.request().frame() === page.mainFrame()) {
+                try {
+                    const text = await response.text();
+
+                    // Always log the very first document response to JSONL + stdout
+                    if (!firstResponseLogged) {
+                        firstResponseLogged = true;
+                        const ms = elapsed();
+                        console.log(`[#${reqId} +${ms}ms] First response: ${response.status()} (${text.length} bytes)`);
+                        logToFile({
+                            ts: new Date().toISOString(),
+                            reqId,
+                            elapsed: ms,
+                            step: 'first-response',
+                            request: { url: targetUrl, headers: reqHeaders, proxyOptions: proxyOpts },
+                            response: { status: response.status(), bodyLength: text.length, body: text },
+                        });
+                    }
+
+                    // In default mode, resolve with the first non-CF HTML
+                    if (!proxyOpts.render) {
                         if (!text.includes('challenge-error-text') && !text.includes('Just a moment')) {
                             if (text.length > 1000) {
-                                resolve(text);
+                                if (proxyOpts.logHtml) {
+                                    logHtmlStep(reqId, 'intercepted-response', text, targetUrl, elapsed(), reqHeaders, proxyOpts);
+                                }
+                                resolveCapture!(text);
                             }
                         } else {
-                            console.log('[-] Cloudflare challenge detected, waiting for it to solve and reload...');
+                            console.log(`[#${reqId} +${elapsed()}ms] Cloudflare challenge detected, waiting for it to solve and reload...`);
                         }
-                    } catch (e) {
-                        // Body might be unavailable during rapid redirects, safe to ignore
                     }
+                } catch (e) {
+                    // Body might be unavailable during rapid redirects, safe to ignore
                 }
-            });
+            }
         });
 
-        await page.goto(targetUrl, { waitUntil: 'commit', timeout: 30000 });
+        if (proxyOpts.render) {
+            // --- RENDER MODE: full JS execution, return final DOM ---
+            await page.goto(targetUrl, { waitUntil: 'commit', timeout: 30000 });
 
-        let rawHtml: string;
-        try {
-            rawHtml = await Promise.race([
-                captureHtmlPromise,
-                new Promise<string>((_, reject) =>
-                    setTimeout(() => reject(new Error('Timeout waiting for real HTML (Cloudflare might be stuck)')), 25000)
-                )
-            ]);
-        } catch (err: any) {
-            console.log(`[-] Intercept timed out, falling back to live DOM.`);
+            if (proxyOpts.logHtml) {
+                const commitHtml = await page.content();
+                logHtmlStep(reqId, 'after-commit', commitHtml, targetUrl, elapsed(), reqHeaders, proxyOpts);
+            }
+
+            // Wait for network to settle
+            await page.waitForLoadState('networkidle', { timeout: proxyOpts.wait }).catch(() => {
+                console.log(`[#${reqId} +${elapsed()}ms] networkidle timed out, continuing with current DOM state`);
+            });
+
+            if (proxyOpts.logHtml) {
+                const idleHtml = await page.content();
+                logHtmlStep(reqId, 'after-networkidle', idleHtml, targetUrl, elapsed(), reqHeaders, proxyOpts);
+            }
+
+            // Wait for a specific selector if requested
+            if (proxyOpts.selector) {
+                try {
+                    await page.waitForSelector(proxyOpts.selector, { timeout: proxyOpts.wait });
+                    console.log(`[#${reqId} +${elapsed()}ms] Selector "${proxyOpts.selector}" appeared`);
+                } catch {
+                    console.log(`[#${reqId} +${elapsed()}ms] Selector "${proxyOpts.selector}" not found within ${proxyOpts.wait}ms`);
+                }
+
+                if (proxyOpts.logHtml) {
+                    const selectorHtml = await page.content();
+                    logHtmlStep(reqId, 'after-selector', selectorHtml, targetUrl, elapsed(), reqHeaders, proxyOpts);
+                }
+            }
+
+            // Extra settle time for late JS mutations
+            await page.waitForTimeout(proxyOpts.settle);
+
             rawHtml = await page.content();
+
+            if (proxyOpts.logHtml) {
+                logHtmlStep(reqId, 'final-rendered', rawHtml, targetUrl, elapsed(), reqHeaders, proxyOpts);
+            }
+        } else {
+            // --- DEFAULT MODE: intercept first real HTML response ---
+            await page.goto(targetUrl, { waitUntil: 'commit', timeout: 30000 });
+
+            try {
+                rawHtml = await Promise.race([
+                    captureHtmlPromise,
+                    new Promise<string>((_, reject) =>
+                        setTimeout(() => reject(new Error('Timeout waiting for real HTML (Cloudflare might be stuck)')), 25000)
+                    )
+                ]);
+            } catch (err: any) {
+                console.log(`[#${reqId} +${elapsed()}ms] Intercept timed out, falling back to live DOM.`);
+                rawHtml = await page.content();
+                if (proxyOpts.logHtml) {
+                    logHtmlStep(reqId, 'fallback-dom', rawHtml, targetUrl, elapsed(), reqHeaders, proxyOpts);
+                }
+            }
         }
 
-        // Inject <base> so the browser resolves all relative URLs (CSS, JS, fonts, etc.)
-        // against the target origin instead of localhost.
         const baseTag = `<base href="${targetOrigin}/">`;
         const finalHtml = rawHtml.replace(/<head([^>]*)>/i, `<head$1>${baseTag}`);
+        responseBody = finalHtml;
 
         return c.html(finalHtml);
 
     } catch (error: any) {
-        console.error(`[-] Error scraping ${targetUrl}:`, error.message);
-        return c.text(`Error scraping page: ${error.message}`, 500);
+        console.error(`[#${reqId} +${elapsed()}ms] Error scraping ${targetUrl}: ${error.message}`);
+        responseStatus = 500;
+        responseError = error.message;
+        responseBody = `Error scraping page: ${error.message}`;
+        return c.text(responseBody, 500);
     } finally {
         if (page) await page.close().catch(logCleanupError);
         if (context) await context.close().catch(logCleanupError);
+
+        const duration = elapsed();
+        console.log(`[#${reqId} +${duration}ms] Complete (${responseStatus})`);
+        logToFile({
+            ts: new Date().toISOString(),
+            reqId,
+            duration,
+            step: 'complete',
+            request: { url: targetUrl, headers: reqHeaders, proxyOptions: proxyOpts },
+            response: {
+                status: responseStatus,
+                bodyLength: responseBody.length,
+                body: responseBody,
+                ...(responseError ? { error: responseError } : {}),
+            },
+        });
     }
 });
 
@@ -180,6 +354,7 @@ initBrowser().then(() => {
         port: PORT
     }, (info) => {
         console.log(`🚀 Headless proxy running at http://localhost:${info.port}`);
+        console.log(`📝 Logging requests to ${LOG_FILE}`);
     });
 });
 
