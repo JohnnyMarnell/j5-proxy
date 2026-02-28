@@ -206,55 +206,117 @@ app.get('/*', async (c) => {
         let rawHtml: string;
         let firstResponseLogged = false;
 
+        // Early-exit for JSON responses — resolves with { body, headers, status }
+        let resolveJson: ((result: { body: string; headers: Record<string, string>; status: number }) => void) | null = null;
+        const jsonResponsePromise = new Promise<{ body: string; headers: Record<string, string>; status: number }>((resolve) => { resolveJson = resolve; });
+
         // Single response listener shared by both modes.
         // Always logs the first document response to JSONL immediately.
+        // If response is JSON, short-circuits via jsonResponsePromise.
         // In default mode, also resolves captureHtmlPromise.
         let resolveCapture: ((html: string) => void) | null = null;
         const captureHtmlPromise = new Promise<string>((resolve) => { resolveCapture = resolve; });
 
         page.on('response', async (response: any) => {
-            if (response.request().resourceType() === 'document' && response.request().frame() === page.mainFrame()) {
-                try {
-                    const text = await response.text();
+            if (response.request().frame() !== page.mainFrame()) return;
 
-                    // Always log the very first document response to JSONL + stdout
-                    if (!firstResponseLogged) {
-                        firstResponseLogged = true;
-                        const ms = elapsed();
-                        console.log(`[#${reqId} +${ms}ms] First response: ${response.status()} (${text.length} bytes)`);
-                        logToFile({
-                            ts: new Date().toISOString(),
-                            reqId,
-                            elapsed: ms,
-                            step: 'first-response',
-                            request: { url: targetUrl, headers: reqHeaders, proxyOptions: proxyOpts },
-                            response: { status: response.status(), bodyLength: text.length, body: text },
-                        });
+            const contentType = response.headers()['content-type'] || '';
+            const isJson = contentType.includes('application/json');
+            const isDocument = response.request().resourceType() === 'document';
+
+            if (!isDocument && !isJson) return;
+
+            try {
+                const text = await response.text();
+
+                // JSON response — short-circuit, forward headers + body immediately
+                if (isJson) {
+                    const ms = elapsed();
+                    console.log(`[#${reqId} +${ms}ms] JSON response: ${response.status()} (${text.length} bytes)`);
+
+                    // Collect upstream headers
+                    const upstreamHeaders: Record<string, string> = {};
+                    const rawHeaders = response.headers();
+                    for (const [k, v] of Object.entries(rawHeaders)) {
+                        upstreamHeaders[k] = v as string;
                     }
 
-                    // In default mode, resolve with the first non-CF HTML
-                    if (!proxyOpts.render) {
-                        if (!text.includes('challenge-error-text') && !text.includes('Just a moment')) {
-                            if (text.length > 1000) {
-                                if (proxyOpts.logHtml) {
-                                    logHtmlStep(reqId, 'intercepted-response', text, targetUrl, elapsed(), reqHeaders, proxyOpts);
-                                }
-                                resolveCapture!(text);
-                            }
-                        } else {
-                            console.log(`[#${reqId} +${elapsed()}ms] Cloudflare challenge detected, waiting for it to solve and reload...`);
-                        }
-                    }
-                } catch (e) {
-                    // Body might be unavailable during rapid redirects, safe to ignore
+                    logToFile({
+                        ts: new Date().toISOString(),
+                        reqId,
+                        elapsed: ms,
+                        step: 'json-response',
+                        request: { url: targetUrl, headers: reqHeaders, proxyOptions: proxyOpts },
+                        response: { status: response.status(), bodyLength: text.length, body: text, headers: upstreamHeaders },
+                    });
+
+                    resolveJson!({ body: text, headers: upstreamHeaders, status: response.status() });
+                    return;
                 }
+
+                // Always log the very first document response to JSONL + stdout
+                if (isDocument && !firstResponseLogged) {
+                    firstResponseLogged = true;
+                    const ms = elapsed();
+                    console.log(`[#${reqId} +${ms}ms] First response: ${response.status()} (${text.length} bytes)`);
+                    logToFile({
+                        ts: new Date().toISOString(),
+                        reqId,
+                        elapsed: ms,
+                        step: 'first-response',
+                        request: { url: targetUrl, headers: reqHeaders, proxyOptions: proxyOpts },
+                        response: { status: response.status(), bodyLength: text.length, body: text },
+                    });
+                }
+
+                // In default mode, resolve with the first non-CF HTML
+                if (isDocument && !proxyOpts.render) {
+                    if (!text.includes('challenge-error-text') && !text.includes('Just a moment')) {
+                        if (text.length > 1000) {
+                            if (proxyOpts.logHtml) {
+                                logHtmlStep(reqId, 'intercepted-response', text, targetUrl, elapsed(), reqHeaders, proxyOpts);
+                            }
+                            resolveCapture!(text);
+                        }
+                    } else {
+                        console.log(`[#${reqId} +${elapsed()}ms] Cloudflare challenge detected, waiting for it to solve and reload...`);
+                    }
+                }
+            } catch (e) {
+                // Body might be unavailable during rapid redirects, safe to ignore
             }
         });
 
+        // Navigate — both modes start the same way
+        await page.goto(targetUrl, { waitUntil: 'commit', timeout: 30000 });
+
+        // Race JSON early-exit against the HTML pipeline.
+        // A tiny delay lets the response listener fire before we proceed.
+        const jsonEarlyExit = await Promise.race([
+            jsonResponsePromise.then(r => r),
+            new Promise<null>((resolve) => setTimeout(() => resolve(null), 500)),
+        ]);
+
+        if (jsonEarlyExit) {
+            // JSON detected — forward upstream headers and body, skip HTML pipeline
+            responseStatus = jsonEarlyExit.status;
+            responseBody = jsonEarlyExit.body;
+
+            const headers = new Headers();
+            for (const [k, v] of Object.entries(jsonEarlyExit.headers)) {
+                // Skip hop-by-hop headers
+                if (['transfer-encoding', 'connection', 'keep-alive', 'content-encoding'].includes(k.toLowerCase())) continue;
+                headers.set(k, v);
+            }
+
+            return new Response(jsonEarlyExit.body, {
+                status: jsonEarlyExit.status,
+                headers,
+            });
+        }
+
         if (proxyOpts.render) {
             // --- RENDER MODE: full JS execution, return final DOM ---
-            await page.goto(targetUrl, { waitUntil: 'commit', timeout: 30000 });
-
             if (proxyOpts.logHtml) {
                 const commitHtml = await page.content();
                 logHtmlStep(reqId, 'after-commit', commitHtml, targetUrl, elapsed(), reqHeaders, proxyOpts);
@@ -295,8 +357,6 @@ app.get('/*', async (c) => {
             }
         } else {
             // --- DEFAULT MODE: intercept first real HTML response ---
-            await page.goto(targetUrl, { waitUntil: 'commit', timeout: 30000 });
-
             try {
                 rawHtml = await Promise.race([
                     captureHtmlPromise,
