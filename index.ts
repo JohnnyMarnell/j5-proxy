@@ -6,6 +6,21 @@ import stealth from 'puppeteer-extra-plugin-stealth';
 import { execSync } from 'child_process';
 import { parseArgs } from 'node:util';
 
+// --- DEBOUNCED CLEANUP ERROR LOGGING ---
+let cleanupErrorCount = 0;
+let cleanupErrorTimer: ReturnType<typeof setTimeout> | null = null;
+
+function logCleanupError() {
+    cleanupErrorCount++;
+    if (!cleanupErrorTimer) {
+        cleanupErrorTimer = setTimeout(() => {
+            console.log(`[-] ${cleanupErrorCount} stale CDP session error${cleanupErrorCount > 1 ? 's' : ''} suppressed during cleanup.`);
+            cleanupErrorCount = 0;
+            cleanupErrorTimer = null;
+        }, 2000);
+    }
+}
+
 // --- CLI ARGUMENT PARSING ---
 const { values } = parseArgs({
     options: {
@@ -34,7 +49,6 @@ function getCookies(): any[] {
     
     // Return cached cookies if they exist and haven't expired
     if (cachedCookies.length > 0 && (now - lastCookieFetchTime < COOKIE_CACHE_TTL)) {
-        console.log('[-] Using cached session cookies.');
         return cachedCookies;
     }
 
@@ -79,16 +93,22 @@ app.get('/*', async (c) => {
     }
 
     const targetUrl = path.startsWith('http') ? path : `https://${path}`;
-    console.log(`\n[+] Scrape request: ${targetUrl}`);
 
     let targetOrigin = '';
     try {
-        targetOrigin = new URL(targetUrl).origin;
+        const parsed = new URL(targetUrl);
+        if (!parsed.hostname.includes('.')) {
+            return c.text('Invalid URL provided', 400);
+        }
+        targetOrigin = parsed.origin;
     } catch (e) {
         return c.text('Invalid URL provided', 400);
     }
 
-    let context;
+    console.log(`[+] Scrape request: ${targetUrl}`);
+
+    let context: any;
+    let page: any;
     try {
         // Fetch cookies (triggers Python script if cache is stale)
         const sessionCookies = getCookies();
@@ -103,7 +123,7 @@ app.get('/*', async (c) => {
             await context.addCookies(sessionCookies);
         }
         
-        const page = await context.newPage();
+        page = await context.newPage();
 
         // --- THE ROBUST HTML INTERCEPTOR ---
         const captureHtmlPromise = new Promise<string>((resolve) => {
@@ -126,23 +146,18 @@ app.get('/*', async (c) => {
             });
         });
 
-        console.log('Navigating to target...');
-        
         await page.goto(targetUrl, { waitUntil: 'commit', timeout: 30000 });
 
-        console.log('Waiting for valid HTML payload (bypassing CF if present)...');
-        
         let rawHtml: string;
         try {
             rawHtml = await Promise.race([
                 captureHtmlPromise,
-                new Promise<string>((_, reject) => 
+                new Promise<string>((_, reject) =>
                     setTimeout(() => reject(new Error('Timeout waiting for real HTML (Cloudflare might be stuck)')), 25000)
                 )
             ]);
-            console.log('Success! Intercepted the pure View Source payload.');
         } catch (err: any) {
-            console.log(`Fallback: Promise timed out. Grabbing live DOM content. Error: ${err.message}`);
+            console.log(`[-] Intercept timed out, falling back to live DOM.`);
             rawHtml = await page.content();
         }
 
@@ -158,7 +173,8 @@ app.get('/*', async (c) => {
         console.error(`[-] Error scraping ${targetUrl}:`, error.message);
         return c.text(`Error scraping page: ${error.message}`, 500);
     } finally {
-        if (context) await context.close(); 
+        if (page) await page.close().catch(logCleanupError);
+        if (context) await context.close().catch(logCleanupError);
     }
 });
 
@@ -168,12 +184,15 @@ initBrowser().then(() => {
         fetch: app.fetch,
         port: PORT
     }, (info) => {
-        console.log(`\n🚀 Headless proxy running at http://localhost:${info.port}`);
+        console.log(`🚀 Headless proxy running at http://localhost:${info.port}`);
     });
 });
 
+let shuttingDown = false;
 process.on('SIGINT', async () => {
-    console.log('\nShutting down...');
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log('Shutting down...');
     if (browser) await browser.close();
     process.exit(0);
 });
