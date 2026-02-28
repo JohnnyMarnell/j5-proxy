@@ -96,11 +96,7 @@ app.get('/*', async (c) => {
 
     let targetOrigin = '';
     try {
-        const parsed = new URL(targetUrl);
-        if (!parsed.hostname.includes('.')) {
-            return c.text('Invalid URL provided', 400);
-        }
-        targetOrigin = parsed.origin;
+        targetOrigin = new URL(targetUrl).origin;
     } catch (e) {
         return c.text('Invalid URL provided', 400);
     }
@@ -161,11 +157,10 @@ app.get('/*', async (c) => {
             rawHtml = await page.content();
         }
 
-        // --- THE REGEX MAGIC ---
-        const finalHtml = rawHtml.replace(
-            /(href|src|action)=["'](\/[^/][^"']*)["']/gi,
-            `$1="${targetOrigin}$2"`
-        );
+        // Inject <base> so the browser resolves all relative URLs (CSS, JS, fonts, etc.)
+        // against the target origin instead of localhost.
+        const baseTag = `<base href="${targetOrigin}/">`;
+        const finalHtml = rawHtml.replace(/<head([^>]*)>/i, `<head$1>${baseTag}`);
 
         return c.html(finalHtml);
 
@@ -192,7 +187,6 @@ let shuttingDown = false;
 process.on('SIGINT', async () => {
     if (shuttingDown) return;
     shuttingDown = true;
-    console.log('Shutting down...');
     if (browser) await browser.close();
     process.exit(0);
 });
