@@ -41,8 +41,8 @@ function getCookies(): any[] {
     console.log('[+] Cache expired or empty. Extracting fresh Chrome cookies via Python...');
     try {
         // Execute the Python script synchronously
-        // Ensure extract_cookies.py is in the same directory
-        const pythonOutput = execSync('python3 extract_cookies.py').toString();
+        // Ensure cookies.py is in the same directory
+        const pythonOutput = execSync('python cookies.py').toString();
         
         const parsedCookies = JSON.parse(pythonOutput);
         
