@@ -50,6 +50,8 @@ const { values } = parseArgs({
         'log-html': { type: 'boolean', default: false },
         'log-file': { type: 'string', default: '/tmp/proxy.jsonl' },
         idle: { type: 'string', short: 'i', default: '1800000' }, // auto-shutdown after ms of inactivity, default 30m
+        'throttle-interval': { type: 'string', default: '5000' }, // cache responses for this many ms, default 5s
+        'throttle-regex': { type: 'string', default: '.*' }, // only cache URLs matching this regex
     }
 });
 
@@ -58,6 +60,8 @@ const COOKIE_CACHE_TTL = parseInt(values.ttl as string, 10);
 const GLOBAL_LOG_HTML = values['log-html'] as boolean;
 const LOG_FILE = values['log-file'] as string;
 const IDLE_TIMEOUT = parseInt(values.idle as string, 10);
+const THROTTLE_INTERVAL = parseInt(values['throttle-interval'] as string, 10);
+const THROTTLE_REGEX = new RegExp(values['throttle-regex'] as string);
 
 // --- OS NOTIFICATIONS ---
 function notify(title: string, message: string) {
@@ -87,6 +91,48 @@ let browser: any;
 // --- COOKIE CACHING STATE ---
 let cachedCookies: any[] = [];
 let lastCookieFetchTime: number = 0;
+
+// --- RESPONSE THROTTLE CACHE ---
+interface CachedResponse {
+    body: string;
+    status: number;
+    headers: Record<string, string>;
+    timestamp: number;
+    hits: number;
+}
+
+const responseCache = new Map<string, CachedResponse>();
+
+function getCacheKey(method: string, url: string, queryParams: Record<string, any>): string {
+    const paramsStr = Object.keys(queryParams).length > 0 
+        ? '?' + new URLSearchParams(queryParams as Record<string, string>).toString()
+        : '';
+    return `${method}:${url}${paramsStr}`;
+}
+
+function getCachedResponse(cacheKey: string): CachedResponse | null {
+    const cached = responseCache.get(cacheKey);
+    if (!cached) return null;
+    
+    const age = Date.now() - cached.timestamp;
+    if (age >= THROTTLE_INTERVAL) {
+        responseCache.delete(cacheKey);
+        return null;
+    }
+    
+    cached.hits++;
+    return cached;
+}
+
+function setCachedResponse(cacheKey: string, body: string, status: number, headers: Record<string, string>) {
+    responseCache.set(cacheKey, {
+        body,
+        status,
+        headers,
+        timestamp: Date.now(),
+        hits: 0,
+    });
+}
 
 // Helper function to get cookies (either from cache or by executing Python)
 function getCookies(): any[] {
@@ -156,6 +202,7 @@ function parseProxyOptions(header: string | undefined): ProxyOptions {
         if (lower === 'render') { opts.render = true; continue; }
         if (lower === 'log-html') { opts.logHtml = true; continue; }
         const [key, ...rest] = part.split('=');
+        if (!key) continue;
         const val = rest.join('='); // rejoin in case selector has = in it
         switch (key.trim().toLowerCase()) {
             case 'wait': opts.wait = parseInt(val, 10) || 20000; break;
@@ -236,12 +283,49 @@ app.get('/*', async (c) => {
     const reqHeaders: Record<string, string> = {};
     c.req.raw.headers.forEach((v, k) => { reqHeaders[k] = v; });
 
+    // Check response cache for GET requests (before filtering with throttle-regex)
+    const queryParams: Record<string, any> = {};
+    const urlObj = new URL(targetUrl);
+    urlObj.searchParams.forEach((v, k) => { queryParams[k] = v; });
+    
+    const cacheKey = getCacheKey('GET', targetUrl, queryParams);
+    let cacheHit = false;
+    let fromCache = false;
+
+    // Only use cache if URL matches throttle regex and not using render/selector (these require full JS execution)
+    if (!proxyOpts.render && !proxyOpts.selector && THROTTLE_REGEX.test(targetUrl)) {
+        const cached = getCachedResponse(cacheKey);
+        if (cached) {
+            cacheHit = true;
+            fromCache = true;
+            const duration = elapsed();
+            log(`[#${reqId}] GET ${targetUrl.substring(0, 80)} → ${cached.status} (${cached.body.length}B) ${duration}ms [cache-hit #${cached.hits}]`);
+            logToFile({
+                ts: new Date().toISOString(),
+                reqId,
+                duration,
+                method: 'GET',
+                url: targetUrl,
+                status: cached.status,
+                bodyLength: cached.body.length,
+                cacheHit: true,
+                cacheHits: cached.hits,
+            });
+            const headers = new Headers();
+            for (const [k, v] of Object.entries(cached.headers)) {
+                if (['transfer-encoding', 'connection', 'keep-alive', 'content-encoding'].includes(k.toLowerCase())) continue;
+                headers.set(k, v);
+            }
+            return new Response(cached.body, { status: cached.status, headers });
+        }
+    }
+
     const tags = [
         proxyOpts.render ? 'render' : null,
         proxyOpts.logHtml ? 'log-html' : null,
         proxyOpts.selector ? `selector=${proxyOpts.selector}` : null,
+        (!proxyOpts.render && !proxyOpts.selector && THROTTLE_REGEX.test(targetUrl)) ? 'cached' : null,
     ].filter(Boolean);
-    log(`[#${reqId}] Scrape request: ${targetUrl}${tags.length ? ' [' + tags.join(', ') + ']' : ''}`);
 
     let context: any;
     let page: any;
@@ -446,23 +530,44 @@ app.get('/*', async (c) => {
         responseBody = `Error scraping page: ${error.message}`;
         return c.text(responseBody, 500);
     } finally {
-        if (page) await page.close().catch(logCleanupError);
-        if (context) await context.close().catch(logCleanupError);
+        if (!fromCache) {
+            if (page) await page.close().catch(logCleanupError);
+            if (context) await context.close().catch(logCleanupError);
+        }
 
         const duration = elapsed();
-        log(`[#${reqId} +${duration}ms] Complete (${responseStatus})`);
+        
+        // Cache the response if it's a successful GET request matching the throttle regex (and not using render/selector)
+        if (!fromCache && !proxyOpts.render && !proxyOpts.selector && responseStatus === 200 && THROTTLE_REGEX.test(targetUrl)) {
+            const upstreamHeaders: Record<string, string> = {};
+            // Only cache simple headers (content-type, etc)
+            if (responseBody.length > 0) {
+                upstreamHeaders['content-type'] = 'text/html; charset=utf-8';
+                setCachedResponse(cacheKey, responseBody, responseStatus, upstreamHeaders);
+            }
+        }
+
+        // Single-line logging with stats
+        const cacheStatus = fromCache ? ` [cache-hit #${responseCache.get(cacheKey)?.hits || 0}]` : 
+                           (!proxyOpts.render && !proxyOpts.selector && THROTTLE_REGEX.test(targetUrl) && responseStatus === 200) ? ` [cache-stored]` : '';
+        const proxyOptsStr = tags.length ? ` [${tags.join(', ')}]` : '';
+        const errorStr = responseError ? ` ERR: ${responseError}` : '';
+        
+        log(`[#${reqId}] GET ${targetUrl.substring(0, 70)}${targetUrl.length > 70 ? '...' : ''} → ${responseStatus} (${responseBody.length}B) ${duration}ms${cacheStatus}${proxyOptsStr}${errorStr}`);
+
+        // Detailed JSONL logging
         logToFile({
             ts: new Date().toISOString(),
             reqId,
             duration,
-            step: 'complete',
-            request: { url: targetUrl, headers: reqHeaders, proxyOptions: proxyOpts },
-            response: {
-                status: responseStatus,
-                bodyLength: responseBody.length,
-                body: responseBody,
-                ...(responseError ? { error: responseError } : {}),
-            },
+            method: 'GET',
+            url: targetUrl,
+            status: responseStatus,
+            bodyLength: responseBody.length,
+            cacheHit: fromCache,
+            cacheStored: (!fromCache && !proxyOpts.render && !proxyOpts.selector && responseStatus === 200 && THROTTLE_REGEX.test(targetUrl)),
+            proxyOptions: proxyOpts,
+            ...(responseError ? { error: responseError } : {}),
         });
     }
 });
@@ -476,6 +581,7 @@ initBrowser().then(() => {
         log(`🚀 Headless proxy running at http://localhost:${info.port}`);
         log(`📝 Logging requests to ${LOG_FILE}`);
         log(`⏱  Auto-shutdown after ${IDLE_TIMEOUT / 1000}s idle`);
+        log(`⚡ Response throttle: ${THROTTLE_INTERVAL}ms, regex: ${values['throttle-regex']}`);
         notify('Proxy started', `Listening on port ${info.port}`);
     });
 });
