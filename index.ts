@@ -7,6 +7,26 @@ import { execSync } from 'child_process';
 import { parseArgs } from 'node:util';
 import { appendFileSync } from 'node:fs';
 
+const PYTHON_COOKIE_EXPORT = `${__dirname}/cookies.py`;
+
+// --- LOGGING UTILS ---
+function getTimestamp(): string {
+    const now = new Date();
+    const h = String(now.getHours()).padStart(2, '0');
+    const m = String(now.getMinutes()).padStart(2, '0');
+    const s = String(now.getSeconds()).padStart(2, '0');
+    const ms = String(now.getMilliseconds()).padStart(3, '0');
+    return `${h}:${m}:${s}.${ms}`;
+}
+
+function log(...args: any[]) {
+    console.log(`[${getTimestamp()}]`, ...args);
+}
+
+function logError(...args: any[]) {
+    console.error(`[${getTimestamp()}]`, ...args);
+}
+
 // --- DEBOUNCED CLEANUP ERROR LOGGING ---
 let cleanupErrorCount = 0;
 let cleanupErrorTimer: ReturnType<typeof setTimeout> | null = null;
@@ -15,7 +35,7 @@ function logCleanupError() {
     cleanupErrorCount++;
     if (!cleanupErrorTimer) {
         cleanupErrorTimer = setTimeout(() => {
-            console.log(`[-] ${cleanupErrorCount} stale CDP session error${cleanupErrorCount > 1 ? 's' : ''} suppressed during cleanup.`);
+            log(`[-] ${cleanupErrorCount} stale CDP session error${cleanupErrorCount > 1 ? 's' : ''} suppressed during cleanup.`);
             cleanupErrorCount = 0;
             cleanupErrorTimer = null;
         }, 2000);
@@ -29,6 +49,7 @@ const { values } = parseArgs({
         ttl: { type: 'string', short: 't', default: '3600000' },
         'log-html': { type: 'boolean', default: false },
         'log-file': { type: 'string', default: '/tmp/proxy.jsonl' },
+        idle: { type: 'string', short: 'i', default: '1800000' }, // auto-shutdown after ms of inactivity, default 30m
     }
 });
 
@@ -36,13 +57,23 @@ const PORT = parseInt(values.port as string, 10);
 const COOKIE_CACHE_TTL = parseInt(values.ttl as string, 10);
 const GLOBAL_LOG_HTML = values['log-html'] as boolean;
 const LOG_FILE = values['log-file'] as string;
+const IDLE_TIMEOUT = parseInt(values.idle as string, 10);
+
+// --- OS NOTIFICATIONS ---
+function notify(title: string, message: string) {
+    try {
+        execSync(`osascript -e 'display notification "${message}" with title "${title}"'`, { stdio: 'ignore' });
+    } catch {
+        // Ignore if not on macOS or notifications unavailable
+    }
+}
 
 // --- JSONL LOGGER ---
 function logToFile(entry: Record<string, any>) {
     try {
         appendFileSync(LOG_FILE, JSON.stringify(entry) + '\n');
     } catch (e: any) {
-        console.error(`[!] Failed to write to ${LOG_FILE}: ${e.message}`);
+        logError(`[!] Failed to write to ${LOG_FILE}: ${e.message}`);
     }
 }
 
@@ -66,9 +97,9 @@ function getCookies(): any[] {
         return cachedCookies;
     }
 
-    console.log('[+] Cache expired or empty. Extracting fresh Chrome cookies via Python...');
+    log('[+] Cache expired or empty. Extracting fresh Chrome cookies via Python...');
     try {
-        const pythonOutput = execSync('python cookies.py').toString();
+        const pythonOutput = execSync(`python ${PYTHON_COOKIE_EXPORT}`).toString();
 
         const parsedCookies = JSON.parse(pythonOutput);
 
@@ -79,19 +110,19 @@ function getCookies(): any[] {
         cachedCookies = parsedCookies;
         lastCookieFetchTime = now;
 
-        console.log(`[+] Successfully extracted and cached ${cachedCookies.length} cookies.`);
+        log(`[+] Successfully extracted and cached ${cachedCookies.length} cookies.`);
         return cachedCookies;
     } catch (error: any) {
-        console.error(`[!] Failed to extract cookies via Python: ${error.message}`);
+        logError(`[!] Failed to extract cookies via Python: ${error.message}`);
         return cachedCookies;
     }
 }
 
 // 1. Initialize the browser
 async function initBrowser() {
-    console.log('Booting Chromium...');
+    log('Booting Chromium...');
     browser = await chromium.launch({ headless: true });
-    console.log('Browser ready.');
+    log('Browser ready.');
 }
 
 // --- X-Proxy-Options PARSING ---
@@ -137,7 +168,7 @@ function parseProxyOptions(header: string | undefined): ProxyOptions {
 
 function logHtmlStep(reqId: number, label: string, html: string, url: string, elapsedMs: number, reqHeaders: Record<string, string>, proxyOpts: ProxyOptions) {
     const preview = html.length > 500 ? html.substring(0, 500) + `... (${html.length} chars total)` : html;
-    console.log(`\n[#${reqId} +${elapsedMs}ms HTML:${label}] ${url}\n${'─'.repeat(60)}\n${preview}\n${'─'.repeat(60)}`);
+    log(`\n[#${reqId} +${elapsedMs}ms HTML:${label}] ${url}\n${'─'.repeat(60)}\n${preview}\n${'─'.repeat(60)}`);
     logToFile({
         ts: new Date().toISOString(),
         reqId,
@@ -148,11 +179,40 @@ function logHtmlStep(reqId: number, label: string, html: string, url: string, el
     });
 }
 
+// --- INACTIVITY AUTO-SHUTDOWN ---
+let lastRequestTime = Date.now();
+
+function resetIdleTimer() {
+    lastRequestTime = Date.now();
+}
+
+const idleInterval = setInterval(() => {
+    if (Date.now() - lastRequestTime >= IDLE_TIMEOUT) {
+        log(`[!] No requests for ${IDLE_TIMEOUT / 1000}s — shutting down due to inactivity.`);
+        shutdown('inactivity');
+    }
+}, 10000);
+idleInterval.unref();
+
+// --- SHUTDOWN ---
+let shuttingDown = false;
+
+async function shutdown(reason = 'signal') {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    clearInterval(idleInterval);
+    log(`[!] Shutting down (${reason})...`);
+    notify('Proxy shutting down', `Reason: ${reason}`);
+    if (browser) await browser.close();
+    process.exit(0);
+}
+
 // 2. Define the proxy route
 let requestCounter = 0;
 
 app.get('/*', async (c) => {
     const reqId = ++requestCounter;
+    resetIdleTimer();
     const startTime = Date.now();
     const elapsed = () => Date.now() - startTime;
     const path = c.req.path.substring(1);
@@ -181,7 +241,7 @@ app.get('/*', async (c) => {
         proxyOpts.logHtml ? 'log-html' : null,
         proxyOpts.selector ? `selector=${proxyOpts.selector}` : null,
     ].filter(Boolean);
-    console.log(`[#${reqId}] Scrape request: ${targetUrl}${tags.length ? ' [' + tags.join(', ') + ']' : ''}`);
+    log(`[#${reqId}] Scrape request: ${targetUrl}${tags.length ? ' [' + tags.join(', ') + ']' : ''}`);
 
     let context: any;
     let page: any;
@@ -232,7 +292,7 @@ app.get('/*', async (c) => {
                 // JSON response — short-circuit, forward headers + body immediately
                 if (isJson) {
                     const ms = elapsed();
-                    console.log(`[#${reqId} +${ms}ms] JSON response: ${response.status()} (${text.length} bytes)`);
+                    log(`[#${reqId} +${ms}ms] JSON response: ${response.status()} (${text.length} bytes)`);
 
                     // Collect upstream headers
                     const upstreamHeaders: Record<string, string> = {};
@@ -258,7 +318,7 @@ app.get('/*', async (c) => {
                 if (isDocument && !firstResponseLogged) {
                     firstResponseLogged = true;
                     const ms = elapsed();
-                    console.log(`[#${reqId} +${ms}ms] First response: ${response.status()} (${text.length} bytes)`);
+                    log(`[#${reqId} +${ms}ms] First response: ${response.status()} (${text.length} bytes)`);
                     logToFile({
                         ts: new Date().toISOString(),
                         reqId,
@@ -279,7 +339,7 @@ app.get('/*', async (c) => {
                             resolveCapture!(text);
                         }
                     } else {
-                        console.log(`[#${reqId} +${elapsed()}ms] Cloudflare challenge detected, waiting for it to solve and reload...`);
+                        log(`[#${reqId} +${elapsed()}ms] Cloudflare challenge detected, waiting for it to solve and reload...`);
                     }
                 }
             } catch (e) {
@@ -324,7 +384,7 @@ app.get('/*', async (c) => {
 
             // Wait for network to settle
             await page.waitForLoadState('networkidle', { timeout: proxyOpts.wait }).catch(() => {
-                console.log(`[#${reqId} +${elapsed()}ms] networkidle timed out, continuing with current DOM state`);
+                log(`[#${reqId} +${elapsed()}ms] networkidle timed out, continuing with current DOM state`);
             });
 
             if (proxyOpts.logHtml) {
@@ -336,9 +396,9 @@ app.get('/*', async (c) => {
             if (proxyOpts.selector) {
                 try {
                     await page.waitForSelector(proxyOpts.selector, { timeout: proxyOpts.wait });
-                    console.log(`[#${reqId} +${elapsed()}ms] Selector "${proxyOpts.selector}" appeared`);
+                    log(`[#${reqId} +${elapsed()}ms] Selector "${proxyOpts.selector}" appeared`);
                 } catch {
-                    console.log(`[#${reqId} +${elapsed()}ms] Selector "${proxyOpts.selector}" not found within ${proxyOpts.wait}ms`);
+                    log(`[#${reqId} +${elapsed()}ms] Selector "${proxyOpts.selector}" not found within ${proxyOpts.wait}ms`);
                 }
 
                 if (proxyOpts.logHtml) {
@@ -365,7 +425,7 @@ app.get('/*', async (c) => {
                     )
                 ]);
             } catch (err: any) {
-                console.log(`[#${reqId} +${elapsed()}ms] Intercept timed out, falling back to live DOM.`);
+                log(`[#${reqId} +${elapsed()}ms] Intercept timed out, falling back to live DOM.`);
                 rawHtml = await page.content();
                 if (proxyOpts.logHtml) {
                     logHtmlStep(reqId, 'fallback-dom', rawHtml, targetUrl, elapsed(), reqHeaders, proxyOpts);
@@ -380,7 +440,7 @@ app.get('/*', async (c) => {
         return c.html(finalHtml);
 
     } catch (error: any) {
-        console.error(`[#${reqId} +${elapsed()}ms] Error scraping ${targetUrl}: ${error.message}`);
+        logError(`[#${reqId} +${elapsed()}ms] Error scraping ${targetUrl}: ${error.message}`);
         responseStatus = 500;
         responseError = error.message;
         responseBody = `Error scraping page: ${error.message}`;
@@ -390,7 +450,7 @@ app.get('/*', async (c) => {
         if (context) await context.close().catch(logCleanupError);
 
         const duration = elapsed();
-        console.log(`[#${reqId} +${duration}ms] Complete (${responseStatus})`);
+        log(`[#${reqId} +${duration}ms] Complete (${responseStatus})`);
         logToFile({
             ts: new Date().toISOString(),
             reqId,
@@ -413,15 +473,12 @@ initBrowser().then(() => {
         fetch: app.fetch,
         port: PORT
     }, (info) => {
-        console.log(`🚀 Headless proxy running at http://localhost:${info.port}`);
-        console.log(`📝 Logging requests to ${LOG_FILE}`);
+        log(`🚀 Headless proxy running at http://localhost:${info.port}`);
+        log(`📝 Logging requests to ${LOG_FILE}`);
+        log(`⏱  Auto-shutdown after ${IDLE_TIMEOUT / 1000}s idle`);
+        notify('Proxy started', `Listening on port ${info.port}`);
     });
 });
 
-let shuttingDown = false;
-process.on('SIGINT', async () => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    if (browser) await browser.close();
-    process.exit(0);
-});
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
