@@ -8,7 +8,10 @@
     "@types/bun": "latest"
   },
   "scripts": {
-    "dev": "bun --hot index.ts"
+    "dev": "bun --hot index.ts",
+    "test": "bun test",
+    "test:unit": "bun test test/unit.test.ts",
+    "test:e2e": "bun test test/e2e.test.ts --timeout 60000"
   },
   "peerDependencies": {
     "typescript": "^5"

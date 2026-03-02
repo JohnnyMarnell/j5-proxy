@@ -7,6 +7,8 @@ import { chromium } from 'playwright-extra';
 import stealth from 'puppeteer-extra-plugin-stealth';
 import { execSync } from 'child_process';
 import { appendFileSync } from 'node:fs';
+import { parseProxyOptions, getCacheKey, summarizeBody, stripHopByHop, ResponseCache } from './lib';
+import type { ProxyOptions, CachedResponse } from './lib';
 
 const PYTHON_COOKIE_EXPORT = `${__dirname}/cookies.py`;
 
@@ -78,46 +80,7 @@ let cachedCookies: any[] = [];
 let lastCookieFetchTime: number = 0;
 
 // --- RESPONSE THROTTLE CACHE ---
-interface CachedResponse {
-    body: string;
-    status: number;
-    headers: Record<string, string>;
-    timestamp: number;
-    hits: number;
-}
-
-const responseCache = new Map<string, CachedResponse>();
-
-function getCacheKey(method: string, url: string, queryParams: Record<string, any>): string {
-    const paramsStr = Object.keys(queryParams).length > 0
-        ? '?' + new URLSearchParams(queryParams as Record<string, string>).toString()
-        : '';
-    return `${method}:${url}${paramsStr}`;
-}
-
-function getCachedResponse(cacheKey: string): CachedResponse | null {
-    const cached = responseCache.get(cacheKey);
-    if (!cached) return null;
-
-    const age = Date.now() - cached.timestamp;
-    if (age >= THROTTLE_INTERVAL) {
-        responseCache.delete(cacheKey);
-        return null;
-    }
-
-    cached.hits++;
-    return cached;
-}
-
-function setCachedResponse(cacheKey: string, body: string, status: number, headers: Record<string, string>) {
-    responseCache.set(cacheKey, {
-        body,
-        status,
-        headers,
-        timestamp: Date.now(),
-        hits: 0,
-    });
-}
+const responseCache = new ResponseCache(THROTTLE_INTERVAL);
 
 // Helper function to get cookies (either from cache or by executing Python)
 function getCookies(): any[] {
@@ -154,40 +117,7 @@ async function initBrowser() {
     consola.ready('Browser ready.');
 }
 
-// --- X-Proxy-Options PARSING ---
-interface ProxyOptions {
-    render: boolean;
-    logHtml: boolean;
-    wait: number;
-    selector: string | null;
-    settle: number;
-}
-
-function parseProxyOptions(header: string | undefined): ProxyOptions {
-    const defaults: ProxyOptions = {
-        render: false,
-        logHtml: GLOBAL_LOG_HTML,
-        wait: 20000,
-        selector: null,
-        settle: 1000,
-    };
-    if (!header) return defaults;
-    const parts = header.split(',').map(s => s.trim());
-    for (const part of parts) {
-        const lower = part.toLowerCase();
-        if (lower === 'render') { defaults.render = true; continue; }
-        if (lower === 'log-html') { defaults.logHtml = true; continue; }
-        const [key, ...rest] = part.split('=');
-        if (!key) continue;
-        const val = rest.join('=');
-        switch (key.trim().toLowerCase()) {
-            case 'wait': defaults.wait = parseInt(val, 10) || 20000; break;
-            case 'selector': defaults.selector = val.trim(); break;
-            case 'settle': defaults.settle = parseInt(val, 10) || 1000; break;
-        }
-    }
-    return defaults;
-}
+// parseProxyOptions, ProxyOptions imported from ./lib
 
 function logHtmlStep(reqId: number, label: string, html: string, url: string, elapsedMs: number, reqHeaders: Record<string, string>, proxyOpts: ProxyOptions) {
     const preview = html.length > 500 ? html.substring(0, 500) + `... (${html.length} chars total)` : html;
@@ -230,32 +160,7 @@ async function shutdown(reason = 'signal') {
     process.exit(0);
 }
 
-// --- RESPONSE BODY SUMMARY FOR LOGGING ---
-function summarizeBody(body: string, maxLen = 200): string {
-    if (!body || body.length === 0) return '(empty)';
-    // Try to compact JSON
-    try {
-        const parsed = JSON.parse(body);
-        const compact = JSON.stringify(parsed);
-        if (compact.length <= maxLen) return compact;
-        return compact.substring(0, maxLen) + `…(${compact.length}B)`;
-    } catch {
-        // Not JSON, just truncate
-        if (body.length <= maxLen) return body;
-        return body.substring(0, maxLen) + `…(${body.length}B)`;
-    }
-}
-
-// --- HOP-BY-HOP HEADERS TO STRIP ---
-const HOP_BY_HOP = new Set(['transfer-encoding', 'connection', 'keep-alive', 'content-encoding']);
-
-function stripHopByHop(headers: Record<string, string>): Headers {
-    const out = new Headers();
-    for (const [k, v] of Object.entries(headers)) {
-        if (!HOP_BY_HOP.has(k.toLowerCase())) out.set(k, v);
-    }
-    return out;
-}
+// summarizeBody, stripHopByHop imported from ./lib
 
 // --- REQUEST HANDLING: broken into smaller functions ---
 
@@ -297,7 +202,7 @@ function buildRequestContext(c: import('hono').Context): RequestContext | Respon
         return c.text('Invalid URL provided', 400);
     }
 
-    const proxyOpts = parseProxyOptions(c.req.header('x-proxy-options'));
+    const proxyOpts = parseProxyOptions(c.req.header('x-proxy-options'), GLOBAL_LOG_HTML);
 
     const reqHeaders: Record<string, string> = {};
     c.req.raw.headers.forEach((v, k) => { reqHeaders[k] = v; });
@@ -321,7 +226,7 @@ function buildRequestContext(c: import('hono').Context): RequestContext | Respon
 function tryCache(ctx: RequestContext): Response | null {
     if (ctx.proxyOpts.render || ctx.proxyOpts.selector || !THROTTLE_REGEX.test(ctx.targetUrl)) return null;
 
-    const cached = getCachedResponse(ctx.cacheKey);
+    const cached = responseCache.get(ctx.cacheKey);
     if (!cached) return null;
 
     const duration = elapsed(ctx);
@@ -481,11 +386,11 @@ function logCompletion(ctx: RequestContext, responseStatus: number, responseBody
     // Cache the response if applicable
     if (!fromCache && !ctx.proxyOpts.render && !ctx.proxyOpts.selector && responseStatus === 200 && THROTTLE_REGEX.test(ctx.targetUrl)) {
         if (responseBody.length > 0) {
-            setCachedResponse(ctx.cacheKey, responseBody, responseStatus, { 'content-type': 'text/html; charset=utf-8' });
+            responseCache.set(ctx.cacheKey, responseBody, responseStatus, { 'content-type': 'text/html; charset=utf-8' });
         }
     }
 
-    const cacheStatus = fromCache ? ` [cache-hit #${responseCache.get(ctx.cacheKey)?.hits || 0}]` :
+    const cacheStatus = fromCache ? ` [cache-hit #${responseCache.getEntry(ctx.cacheKey)?.hits || 0}]` :
         (!ctx.proxyOpts.render && !ctx.proxyOpts.selector && THROTTLE_REGEX.test(ctx.targetUrl) && responseStatus === 200) ? ' [cache-stored]' : '';
     const proxyOptsStr = ctx.tags.length ? ` [${ctx.tags.join(', ')}]` : '';
     const errorStr = responseError ? ` ERR: ${responseError}` : '';
