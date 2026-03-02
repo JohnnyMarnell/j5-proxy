@@ -3,14 +3,15 @@ import { parseProxyOptions, getCacheKey, summarizeBody, stripHopByHop, ResponseC
 
 // --- validateZyteAuth ---
 
+const VALID_ZYTE_KEY = 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4'; // exactly 32 lowercase hex chars
+
 describe('validateZyteAuth', () => {
     function basicHeader(key: string, password = ''): string {
         return 'Basic ' + Buffer.from(`${key}:${password}`).toString('base64');
     }
 
-    test('returns key for valid auth header (curl -u "KEY":)', () => {
-        const key = 'abcd1234efgh5678';
-        expect(validateZyteAuth(basicHeader(key))).toBe(key);
+    test('returns key for a valid 32-char lowercase hex key (curl -u "KEY":)', () => {
+        expect(validateZyteAuth(basicHeader(VALID_ZYTE_KEY))).toBe(VALID_ZYTE_KEY);
     });
 
     test('returns null when Authorization header is absent', () => {
@@ -25,33 +26,44 @@ describe('validateZyteAuth', () => {
         expect(validateZyteAuth(basicHeader(''))).toBeNull();
     });
 
-    test('returns null when key is too short (< 4 chars)', () => {
-        expect(validateZyteAuth(basicHeader('abc'))).toBeNull();
+    test('returns null when key is only 31 hex chars (too short by one)', () => {
+        expect(validateZyteAuth(basicHeader('a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3'))).toBeNull();
+    });
+
+    test('returns null when key is 33 hex chars (too long by one)', () => {
+        expect(validateZyteAuth(basicHeader('a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e'))).toBeNull();
     });
 
     test('returns null when header is not Basic scheme', () => {
-        expect(validateZyteAuth('Bearer sometoken')).toBeNull();
+        expect(validateZyteAuth(`Bearer ${VALID_ZYTE_KEY}`)).toBeNull();
     });
 
     test('returns null for invalid base64 payload', () => {
         expect(validateZyteAuth('Basic !!not-base64!!')).toBeNull();
     });
 
-    test('returns null when key contains illegal characters', () => {
-        // spaces and @ are not permitted
-        expect(validateZyteAuth(basicHeader('invalid key!'))).toBeNull();
-        expect(validateZyteAuth(basicHeader('bad@key'))).toBeNull();
+    test('returns null when key contains uppercase hex chars', () => {
+        // Same bytes, but uppercase — Zyte keys are lowercase only
+        const upper = VALID_ZYTE_KEY.toUpperCase();
+        expect(validateZyteAuth(basicHeader(upper))).toBeNull();
     });
 
-    test('accepts keys with hyphens and underscores', () => {
-        const key = 'my-api_key-1234';
-        expect(validateZyteAuth(basicHeader(key))).toBe(key);
+    test('returns null when key contains non-hex characters', () => {
+        const nonHex = 'g1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4'; // 'g' is not hex
+        expect(validateZyteAuth(basicHeader(nonHex))).toBeNull();
+    });
+
+    test('returns null when key contains hyphens or underscores', () => {
+        // Previously accepted, now rejected — must be pure hex
+        const withHyphen  = 'a1b2c3d4-5f6a1b2c3d4e5f6a1b2c3d4';
+        const withUnderscore = 'a1b2c3d4_5f6a1b2c3d4e5f6a1b2c3d4';
+        expect(validateZyteAuth(basicHeader(withHyphen))).toBeNull();
+        expect(validateZyteAuth(basicHeader(withUnderscore))).toBeNull();
     });
 
     test('strips password portion correctly (key:password format)', () => {
-        // Even if a password is supplied the key is still returned
-        const key = 'validkeyhere';
-        expect(validateZyteAuth(basicHeader(key, 'somepassword'))).toBe(key);
+        // Even if a password is supplied, the key is still extracted and validated
+        expect(validateZyteAuth(basicHeader(VALID_ZYTE_KEY, 'somepassword'))).toBe(VALID_ZYTE_KEY);
     });
 });
 

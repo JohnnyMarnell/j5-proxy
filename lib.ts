@@ -4,8 +4,8 @@
  * Validates HTTP Basic auth for Zyte API emulation.
  *
  * curl uses `-u "KEY":` which sends `Authorization: Basic base64(KEY:)`.
- * The username (API key) must be non-empty and look like a valid key
- * (alphanumeric/dash/underscore, at least 4 characters).
+ * The username (API key) must be exactly 32 lowercase hex characters,
+ * matching the format Zyte uses for real API keys.
  *
  * Returns the key string if valid, or null if missing/invalid.
  */
@@ -24,7 +24,8 @@ export function validateZyteAuth(authHeader: string | undefined): string | null 
     const colonIdx = decoded.indexOf(':');
     const key = colonIdx >= 0 ? decoded.slice(0, colonIdx) : decoded;
 
-    if (!key || key.length < 4 || !/^[a-zA-Z0-9_-]+$/.test(key)) return null;
+    // Zyte API keys are exactly 32 lowercase hex characters
+    if (!/^[0-9a-f]{32}$/.test(key)) return null;
 
     return key;
 }

@@ -116,6 +116,33 @@ function proxyUrl(path: string): string {
     return `http://localhost:${PROXY_PORT}/http://localhost:${TARGET_PORT}${path}`;
 }
 
+// --- Zyte helpers ---
+
+const ZYTE_VALID_KEY = 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4'; // exactly 32 lowercase hex chars
+
+function zyteExtractUrl(version = 'v1'): string {
+    // Route is /:version{v\d+}/extract — e.g. /v1/extract
+    return `http://localhost:${PROXY_PORT}/${version}/extract`;
+}
+
+function zyteBasicAuth(key: string): string {
+    return 'Basic ' + Buffer.from(`${key}:`).toString('base64');
+}
+
+async function zytePost(
+    body: Record<string, any>,
+    key: string | null = ZYTE_VALID_KEY,
+    version = 'v1',
+): Promise<Response> {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (key !== null) headers['Authorization'] = zyteBasicAuth(key);
+    return fetch(zyteExtractUrl(version), {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+    });
+}
+
 describe('e2e', () => {
     test('proxies HTML and injects base tag', async () => {
         log('TEST: proxies HTML and injects base tag');
@@ -176,6 +203,7 @@ describe('e2e', () => {
     }, 10000);
 
     test('response cache returns same content on second hit', async () => {
+
         log('TEST: response cache returns same content on second hit');
         
         log('  First request...');
@@ -195,6 +223,147 @@ describe('e2e', () => {
         expect(res2.status).toBe(200);
         expect(body2).toBe(body1);
         log(`  → Cache speedup: ${elapsed1}ms → ${elapsed2}ms\n`);
+        log('  ✓ PASS\n');
+    }, 30000);
+});
+
+describe('e2e Zyte /v1/extract', () => {
+    test('returns 401 with Zyte error body when Authorization header is absent', async () => {
+        log('TEST: Zyte 401 — no auth header');
+        const res = await zytePost({ url: `http://localhost:${TARGET_PORT}/html`, httpResponseBody: true }, null);
+        log(`  → status ${res.status}`);
+        expect(res.status).toBe(401);
+        const data = await res.json();
+        log(`  → body: ${JSON.stringify(data)}`);
+        expect(data.type).toBe('/auth/key-not-found');
+        expect(data.status).toBe(401);
+        log('  ✓ PASS\n');
+    }, 10000);
+
+    test('returns 401 with Zyte error body when API key is empty (curl -u "":)', async () => {
+        log('TEST: Zyte 401 — empty key');
+        const res = await zytePost({ url: `http://localhost:${TARGET_PORT}/html`, httpResponseBody: true }, '');
+        log(`  → status ${res.status}`);
+        expect(res.status).toBe(401);
+        const data = await res.json();
+        expect(data.type).toBe('/auth/key-not-found');
+        log('  ✓ PASS\n');
+    }, 10000);
+
+    test('returns 400 when url field is missing', async () => {
+        log('TEST: Zyte 400 — missing url');
+        const res = await zytePost({});
+        log(`  → status ${res.status}`);
+        expect(res.status).toBe(400);
+        const data = await res.json();
+        expect(data.status).toBe(400);
+        log('  ✓ PASS\n');
+    }, 10000);
+
+    test('returns 400 for invalid JSON body', async () => {
+        log('TEST: Zyte 400 — invalid JSON');
+        const res = await fetch(zyteExtractUrl(), {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': zyteBasicAuth(ZYTE_VALID_KEY),
+            },
+            body: 'not-json',
+        });
+        log(`  → status ${res.status}`);
+        expect(res.status).toBe(400);
+        log('  ✓ PASS\n');
+    }, 10000);
+
+    test('fetches page and returns base64-encoded httpResponseBody', async () => {
+        log('TEST: Zyte extract — valid request with httpResponseBody');
+        const start = Date.now();
+
+        const heartbeat = setInterval(() => log(`  ... still waiting (${Date.now() - start}ms)`), 5000);
+        const res = await zytePost({
+            url: `http://localhost:${TARGET_PORT}/html`,
+            httpResponseBody: true,
+        });
+        clearInterval(heartbeat);
+
+        const elapsed = Date.now() - start;
+        log(`  → status ${res.status} in ${elapsed}ms`);
+        expect(res.status).toBe(200);
+
+        const data = await res.json();
+        log(`  → url=${data.url} statusCode=${data.statusCode} httpResponseBody length=${data.httpResponseBody?.length}`);
+
+        expect(data.url).toBe(`http://localhost:${TARGET_PORT}/html`);
+        expect(data.statusCode).toBe(200);
+        expect(typeof data.httpResponseBody).toBe('string');
+
+        const decoded = Buffer.from(data.httpResponseBody, 'base64').toString('utf-8');
+        log(`  → decoded body: ${decoded.length} bytes`);
+        expect(decoded).toContain('<h1>Hello from mock server</h1>');
+        log('  ✓ PASS\n');
+    }, 30000);
+
+    test('omits httpResponseBody field when not requested', async () => {
+        log('TEST: Zyte extract — httpResponseBody not requested');
+        const start = Date.now();
+
+        const heartbeat = setInterval(() => log(`  ... still waiting (${Date.now() - start}ms)`), 5000);
+        const res = await zytePost({
+            url: `http://localhost:${TARGET_PORT}/html`,
+            httpResponseBody: false,
+        });
+        clearInterval(heartbeat);
+
+        const elapsed = Date.now() - start;
+        log(`  → status ${res.status} in ${elapsed}ms`);
+        expect(res.status).toBe(200);
+
+        const data = await res.json();
+        log(`  → keys: ${Object.keys(data).join(', ')}`);
+        expect(data.url).toBe(`http://localhost:${TARGET_PORT}/html`);
+        expect(data.statusCode).toBe(200);
+        expect(data.httpResponseBody).toBeUndefined();
+        log('  ✓ PASS\n');
+    }, 30000);
+
+    test('normalizes bare hostname url (no scheme)', async () => {
+        log('TEST: Zyte extract — bare hostname normalized to https://');
+        // We can't actually fetch localhost without scheme usefully, so just check
+        // the returned `url` field reflects the normalization (it will 500 on
+        // connect but the URL normalisation happens before Playwright).
+        const res = await zytePost({ url: 'example.invalid', httpResponseBody: false });
+        log(`  → status ${res.status}`);
+        // Will be 500 (unreachable host) but NOT 400 — the URL was valid after normalisation
+        expect(res.status).not.toBe(400);
+        if (res.status === 200) {
+            const data = await res.json();
+            expect(data.url).toBe('https://example.invalid');
+        }
+        log('  ✓ PASS\n');
+    }, 30000);
+
+    test('works with /v2/extract path (version-agnostic routing)', async () => {
+        log('TEST: Zyte extract — /v2/extract');
+        const start = Date.now();
+
+        const heartbeat = setInterval(() => log(`  ... still waiting (${Date.now() - start}ms)`), 5000);
+        const res = await zytePost(
+            { url: `http://localhost:${TARGET_PORT}/html`, httpResponseBody: true },
+            ZYTE_VALID_KEY,
+            'v2',
+        );
+        clearInterval(heartbeat);
+
+        const elapsed = Date.now() - start;
+        log(`  → status ${res.status} in ${elapsed}ms`);
+        expect(res.status).toBe(200);
+
+        const data = await res.json();
+        expect(data.statusCode).toBe(200);
+        expect(typeof data.httpResponseBody).toBe('string');
+
+        const decoded = Buffer.from(data.httpResponseBody, 'base64').toString('utf-8');
+        expect(decoded).toContain('<h1>Hello from mock server</h1>');
         log('  ✓ PASS\n');
     }, 30000);
 });

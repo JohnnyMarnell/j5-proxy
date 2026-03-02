@@ -425,7 +425,7 @@ const app = new Hono();
 // Body:    { url, httpResponseBody?: boolean }
 // Returns: { url, statusCode, httpResponseBody?: base64 }
 
-app.post('/v:version/extract', async (c) => {
+app.post('/:version{v\\d+}/extract', async (c) => {
     const reqId = ++requestCounter;
     resetIdleTimer();
     const startTime = Date.now();
