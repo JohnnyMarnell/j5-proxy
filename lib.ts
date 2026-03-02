@@ -1,3 +1,34 @@
+// --- ZYTE API AUTH VALIDATION ---
+
+/**
+ * Validates HTTP Basic auth for Zyte API emulation.
+ *
+ * curl uses `-u "KEY":` which sends `Authorization: Basic base64(KEY:)`.
+ * The username (API key) must be non-empty and look like a valid key
+ * (alphanumeric/dash/underscore, at least 4 characters).
+ *
+ * Returns the key string if valid, or null if missing/invalid.
+ */
+export function validateZyteAuth(authHeader: string | undefined): string | null {
+    if (!authHeader || !authHeader.startsWith('Basic ')) return null;
+
+    const encoded = authHeader.slice('Basic '.length);
+    let decoded: string;
+    try {
+        decoded = Buffer.from(encoded, 'base64').toString('utf-8');
+    } catch {
+        return null;
+    }
+
+    // Format is "key:" (password is always empty for Zyte)
+    const colonIdx = decoded.indexOf(':');
+    const key = colonIdx >= 0 ? decoded.slice(0, colonIdx) : decoded;
+
+    if (!key || key.length < 4 || !/^[a-zA-Z0-9_-]+$/.test(key)) return null;
+
+    return key;
+}
+
 // --- X-Proxy-Options PARSING ---
 export interface ProxyOptions {
     render: boolean;

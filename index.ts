@@ -7,7 +7,7 @@ import { chromium } from 'playwright-extra';
 import stealth from 'puppeteer-extra-plugin-stealth';
 import { execSync } from 'child_process';
 import { appendFileSync } from 'node:fs';
-import { parseProxyOptions, getCacheKey, summarizeBody, stripHopByHop, ResponseCache } from './lib';
+import { parseProxyOptions, getCacheKey, summarizeBody, stripHopByHop, ResponseCache, validateZyteAuth } from './lib';
 import type { ProxyOptions, CachedResponse } from './lib';
 
 const PYTHON_COOKIE_EXPORT = `${__dirname}/cookies.py`;
@@ -418,6 +418,165 @@ function logCompletion(ctx: RequestContext, responseStatus: number, responseBody
 }
 
 const app = new Hono();
+
+// --- ZYTE API EMULATION ---
+// Matches: POST https://api.zyte.com/v1/extract (or any /v*/extract)
+// Auth:    HTTP Basic, username = Zyte API key (non-empty, alphanumeric)
+// Body:    { url, httpResponseBody?: boolean }
+// Returns: { url, statusCode, httpResponseBody?: base64 }
+
+app.post('/v:version/extract', async (c) => {
+    const reqId = ++requestCounter;
+    resetIdleTimer();
+    const startTime = Date.now();
+
+    // --- Auth ---
+    const apiKey = validateZyteAuth(c.req.header('authorization'));
+    if (!apiKey) {
+        return c.json({
+            type: '/auth/key-not-found',
+            title: 'Authentication Key Not Found',
+            status: 401,
+            detail: "The authentication key is not valid or can't be matched.",
+        }, 401);
+    }
+
+    // --- Body ---
+    let body: Record<string, any>;
+    try {
+        body = await c.req.json();
+    } catch {
+        return c.json({ type: '/error/bad-request', title: 'Bad Request', status: 400, detail: 'Invalid JSON body.' }, 400);
+    }
+
+    const rawUrl: string | undefined = body.url;
+    if (!rawUrl) {
+        return c.json({ type: '/error/bad-request', title: 'Bad Request', status: 400, detail: 'Missing required field: url.' }, 400);
+    }
+
+    // Normalize URL (Zyte accepts bare hostnames like "www.google.com")
+    const targetUrl = rawUrl.startsWith('http://') || rawUrl.startsWith('https://')
+        ? rawUrl
+        : `https://${rawUrl}`;
+
+    try {
+        new URL(targetUrl);
+    } catch {
+        return c.json({ type: '/error/bad-request', title: 'Bad Request', status: 400, detail: 'Invalid URL.' }, 400);
+    }
+
+    const wantHttpResponseBody = !!body.httpResponseBody;
+    const version = c.req.param('version');
+
+    consola.info(`[#${reqId}] ZYTE POST /v${version}/extract key=${apiKey.slice(0, 4)}… url=${targetUrl}`);
+
+    // --- Fetch via Playwright (reuses shared browser + cookie cache) ---
+    let browserContext: any;
+    let page: any;
+    let responseStatus = 200;
+    let responseBody = '';
+
+    try {
+        const sessionCookies = getCookies();
+
+        browserContext = await browser.newContext({
+            userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            viewport: { width: 1280, height: 720 },
+        });
+
+        if (sessionCookies.length > 0) {
+            await browserContext.addCookies(sessionCookies);
+        }
+
+        page = await browserContext.newPage();
+
+        // Capture the first real document response (same Cloudflare-aware logic as GET handler)
+        let captureResolve: (v: { body: string; status: number }) => void;
+        let captured = false;
+        const capturePromise = new Promise<{ body: string; status: number }>((resolve) => {
+            captureResolve = resolve;
+        });
+
+        page.on('response', async (response: any) => {
+            if (captured) return;
+            if (response.request().frame() !== page.mainFrame()) return;
+            if (response.request().resourceType() !== 'document') return;
+
+            try {
+                const text = await response.text();
+                if (
+                    text.length > 0 &&
+                    !text.includes('challenge-error-text') &&
+                    !text.includes('Just a moment')
+                ) {
+                    captured = true;
+                    captureResolve({ body: text, status: response.status() });
+                }
+            } catch {
+                // Body unavailable during rapid redirects — ignore
+            }
+        });
+
+        await page.goto(targetUrl, { waitUntil: 'commit', timeout: 30000 });
+
+        let result: { body: string; status: number };
+        try {
+            result = await Promise.race([
+                capturePromise,
+                new Promise<never>((_, reject) =>
+                    setTimeout(() => reject(new Error('Timeout waiting for document response')), 25000)
+                ),
+            ]);
+        } catch {
+            consola.warn(`[#${reqId}] ZYTE intercept timed out, falling back to live DOM`);
+            const html = await page.content();
+            result = { body: html, status: 200 };
+        }
+
+        responseStatus = result.status;
+        responseBody = result.body;
+
+        const duration = Date.now() - startTime;
+        consola.success(`[#${reqId}] ZYTE ${targetUrl.substring(0, 70)} → ${responseStatus} (${responseBody.length}B) ${duration}ms`);
+        logToFile({
+            ts: new Date().toISOString(),
+            reqId,
+            duration,
+            method: 'ZYTE',
+            url: targetUrl,
+            status: responseStatus,
+            bodyLength: responseBody.length,
+        });
+
+        const zyteResult: Record<string, any> = {
+            url: targetUrl,
+            statusCode: responseStatus,
+        };
+        if (wantHttpResponseBody) {
+            zyteResult.httpResponseBody = Buffer.from(responseBody).toString('base64');
+        }
+
+        return c.json(zyteResult);
+
+    } catch (error: any) {
+        const duration = Date.now() - startTime;
+        consola.error(`[#${reqId}] ZYTE error ${targetUrl}: ${error.message}`);
+        logToFile({
+            ts: new Date().toISOString(),
+            reqId,
+            duration,
+            method: 'ZYTE',
+            url: targetUrl,
+            status: 500,
+            error: error.message,
+        });
+        return c.json({ type: '/error/internal', title: 'Internal Error', status: 500, detail: error.message }, 500);
+
+    } finally {
+        if (page) await page.close().catch(logCleanupError);
+        if (browserContext) await browserContext.close().catch(logCleanupError);
+    }
+});
 
 app.get('/*', async (c) => {
     const ctxOrResponse = buildRequestContext(c);

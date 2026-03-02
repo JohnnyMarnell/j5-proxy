@@ -1,5 +1,59 @@
 import { test, expect, describe } from 'bun:test';
-import { parseProxyOptions, getCacheKey, summarizeBody, stripHopByHop, ResponseCache } from '../lib';
+import { parseProxyOptions, getCacheKey, summarizeBody, stripHopByHop, ResponseCache, validateZyteAuth } from '../lib';
+
+// --- validateZyteAuth ---
+
+describe('validateZyteAuth', () => {
+    function basicHeader(key: string, password = ''): string {
+        return 'Basic ' + Buffer.from(`${key}:${password}`).toString('base64');
+    }
+
+    test('returns key for valid auth header (curl -u "KEY":)', () => {
+        const key = 'abcd1234efgh5678';
+        expect(validateZyteAuth(basicHeader(key))).toBe(key);
+    });
+
+    test('returns null when Authorization header is absent', () => {
+        expect(validateZyteAuth(undefined)).toBeNull();
+    });
+
+    test('returns null for empty string header', () => {
+        expect(validateZyteAuth('')).toBeNull();
+    });
+
+    test('returns null when key is empty (curl -u "":)', () => {
+        expect(validateZyteAuth(basicHeader(''))).toBeNull();
+    });
+
+    test('returns null when key is too short (< 4 chars)', () => {
+        expect(validateZyteAuth(basicHeader('abc'))).toBeNull();
+    });
+
+    test('returns null when header is not Basic scheme', () => {
+        expect(validateZyteAuth('Bearer sometoken')).toBeNull();
+    });
+
+    test('returns null for invalid base64 payload', () => {
+        expect(validateZyteAuth('Basic !!not-base64!!')).toBeNull();
+    });
+
+    test('returns null when key contains illegal characters', () => {
+        // spaces and @ are not permitted
+        expect(validateZyteAuth(basicHeader('invalid key!'))).toBeNull();
+        expect(validateZyteAuth(basicHeader('bad@key'))).toBeNull();
+    });
+
+    test('accepts keys with hyphens and underscores', () => {
+        const key = 'my-api_key-1234';
+        expect(validateZyteAuth(basicHeader(key))).toBe(key);
+    });
+
+    test('strips password portion correctly (key:password format)', () => {
+        // Even if a password is supplied the key is still returned
+        const key = 'validkeyhere';
+        expect(validateZyteAuth(basicHeader(key, 'somepassword'))).toBe(key);
+    });
+});
 
 // --- parseProxyOptions ---
 
