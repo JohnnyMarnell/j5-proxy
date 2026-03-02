@@ -1,3 +1,6 @@
+/// <reference lib="dom" />
+import { serve } from '@hono/node-server';
+import { Hono } from 'hono';
 import { cac } from 'cac';
 import consola from 'consola';
 import { chromium } from 'playwright-extra';
@@ -273,17 +276,16 @@ function elapsed(ctx: RequestContext): number {
     return Date.now() - ctx.startTime;
 }
 
-/** Parse the incoming request URL and proxy options into a RequestContext, or return an error Response. */
-function buildRequestContext(req: Request): RequestContext | Response {
+/** Parse the incoming Hono context into a RequestContext, or return an error Response. */
+function buildRequestContext(c: import('hono').Context): RequestContext | Response {
     const reqId = ++requestCounter;
     resetIdleTimer();
     const startTime = Date.now();
 
-    const url = new URL(req.url);
-    const path = url.pathname.substring(1);
+    const path = c.req.path.substring(1);
 
     if (!path || path === 'favicon.ico') {
-        return new Response('Not found', { status: 404 });
+        return c.text('Not found', 404);
     }
 
     const targetUrl = path.startsWith('http') ? path : `https://${path}`;
@@ -292,13 +294,13 @@ function buildRequestContext(req: Request): RequestContext | Response {
     try {
         targetOrigin = new URL(targetUrl).origin;
     } catch {
-        return new Response('Invalid URL provided', { status: 400 });
+        return c.text('Invalid URL provided', 400);
     }
 
-    const proxyOpts = parseProxyOptions(req.headers.get('x-proxy-options') ?? undefined);
+    const proxyOpts = parseProxyOptions(c.req.header('x-proxy-options'));
 
     const reqHeaders: Record<string, string> = {};
-    req.headers.forEach((v, k) => { reqHeaders[k] = v; });
+    c.req.raw.headers.forEach((v, k) => { reqHeaders[k] = v; });
 
     const queryParams: Record<string, string> = {};
     const urlObj = new URL(targetUrl);
@@ -510,9 +512,10 @@ function logCompletion(ctx: RequestContext, responseStatus: number, responseBody
     });
 }
 
-/** Main request handler. */
-async function handleRequest(req: Request): Promise<Response> {
-    const ctxOrResponse = buildRequestContext(req);
+const app = new Hono();
+
+app.get('/*', async (c) => {
+    const ctxOrResponse = buildRequestContext(c);
     if (ctxOrResponse instanceof Response) return ctxOrResponse;
     const ctx = ctxOrResponse;
 
@@ -582,23 +585,23 @@ async function handleRequest(req: Request): Promise<Response> {
 
         logCompletion(ctx, responseStatus, responseBody, false, responseError);
     }
-}
-
-// --- START ---
-await initBrowser();
-
-Bun.serve({
-    port: PORT,
-    fetch: handleRequest,
 });
 
-consola.box(
-    `🚀 Headless proxy running at http://localhost:${PORT}\n` +
-    `📝 Logging requests to ${LOG_FILE}\n` +
-    `⏱  Auto-shutdown after ${IDLE_TIMEOUT / 1000}s idle\n` +
-    `⚡ Response throttle: ${THROTTLE_INTERVAL}ms, regex: ${opts.throttleRegex}`
-);
-notify('Proxy started', `Listening on port ${PORT}`);
+// --- START ---
+initBrowser().then(() => {
+    serve({
+        fetch: app.fetch,
+        port: PORT
+    }, (info) => {
+        consola.box(
+            `🚀 Headless proxy running at http://localhost:${info.port}\n` +
+            `📝 Logging requests to ${LOG_FILE}\n` +
+            `⏱  Auto-shutdown after ${IDLE_TIMEOUT / 1000}s idle\n` +
+            `⚡ Response throttle: ${THROTTLE_INTERVAL}ms, regex: ${opts.throttleRegex}`
+        );
+        notify('Proxy started', `Listening on port ${info.port}`);
+    });
+});
 
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
