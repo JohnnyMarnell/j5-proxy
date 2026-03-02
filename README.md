@@ -22,9 +22,14 @@ bun --hot index.ts
 | `-t`, `--ttl` | `3600000` | Cookie cache TTL (ms) |
 | `--log-html` | `false` | Log HTML at each pipeline step to stdout (all requests) |
 | `--log-file` | `/tmp/proxy.jsonl` | Path for the JSONL request log |
+| `-i`, `--idle` | `1800000` | Auto-shutdown after ms of inactivity (default 30m) |
+| `--throttle-interval` | `5000` | Cache responses for this many ms |
+| `--throttle-regex` | `.*` | Only cache URLs matching this regex |
 
 ```bash
 bun --hot index.ts -p 3000 --log-html --log-file ./requests.jsonl
+bun --hot index.ts --throttle-interval 10000 --throttle-regex 'example\.com'
+bun --hot index.ts --help
 ```
 
 ## Usage
@@ -83,6 +88,10 @@ curl http://localhost:8787/api.example.com/v1/data
 # Returns JSON with original headers (content-type, cache-control, etc.)
 ```
 
+### Response throttle cache
+
+GET requests are cached for `--throttle-interval` ms (default 5s) to avoid hammering the same URL. Only URLs matching `--throttle-regex` are cached. Render/selector requests bypass the cache.
+
 ### HTML step logging
 
 Log the HTML at each stage of the pipeline to stdout. Enable per-request or globally:
@@ -122,7 +131,6 @@ Every request is logged to `/tmp/proxy.jsonl` (configurable via `--log-file`). E
 | `after-selector` | DOM after selector found (with `log-html` + `render` + `selector`) |
 | `final-rendered` | Final rendered DOM (with `log-html` + `render`) |
 | `fallback-dom` | Timeout fallback (with `log-html`) |
-| `complete` | Always — final summary with total duration |
 
 Each entry includes:
 
@@ -152,10 +160,19 @@ Each entry includes:
 tail -f /tmp/proxy.jsonl | jq '{id:.reqId, step:.step, ms:.elapsed}'
 
 # See just completed requests with timing
-tail -f /tmp/proxy.jsonl | jq 'select(.step=="complete") | {id:.reqId, url:.request.url, ms:.duration, status:.response.status}'
+tail -f /tmp/proxy.jsonl | jq 'select(.duration) | {id:.reqId, url:.url, ms:.duration, status:.status}'
 
 # Filter JSON API responses
 tail -f /tmp/proxy.jsonl | jq 'select(.step=="json-response") | {url:.request.url, ms:.elapsed, len:.response.bodyLength}'
+```
+
+### Non-2XX response logging
+
+When the upstream returns a non-2XX status, the log line includes the response body (truncated, JSON compacted) for easier debugging:
+
+```
+✔ [#1] GET https://example.com → 200 (48231B) 342ms [cache-stored]
+⚠ [#2] GET https://example.com/missing → 404 (153B) 210ms body={"error":"not found"}
 ```
 
 ### Per-request timing
@@ -163,18 +180,20 @@ tail -f /tmp/proxy.jsonl | jq 'select(.step=="json-response") | {url:.request.ur
 All stdout and JSONL entries are tagged with `#reqId` and `+elapsedMs`, so concurrent requests stay distinguishable:
 
 ```
-[#1] Scrape request: https://example.com [render]
-[#1 +342ms] First response: 200 (48231 bytes)
-[#2] Scrape request: https://api.example.com/data
-[#2 +180ms] JSON response: 200 (4523 bytes)
-[#2 +195ms] Complete (200)
-[#1 +2905ms] Selector "#content" appeared
-[#1 +4112ms] Complete (200)
+ℹ [#1 +342ms] First response: 200 (48231 bytes)
+ℹ [#2 +180ms] JSON response: 200 (4523 bytes)
+✔ [#2] GET https://api.example.com/data → 200 (4523B) 195ms
+⚠ [#1 +2905ms] Selector "#content" not found within 20000ms
+✔ [#1] GET https://example.com → 200 (52001B) 4112ms [render]
 ```
 
 ### Cookie injection
 
 Cookies are automatically extracted from your local Chrome via `cookies.py` and injected into every browser context. They're cached for the TTL duration (default 1 hour) to avoid repeated extraction.
+
+### Idle auto-shutdown
+
+The proxy automatically shuts down after `--idle` ms (default 30 minutes) of inactivity. A macOS notification is sent on shutdown.
 
 ## X-Proxy-Options reference
 
