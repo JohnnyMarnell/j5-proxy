@@ -2,7 +2,24 @@
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import { cac } from 'cac';
-import consola from 'consola';
+import consola, { type ConsolaReporter, type LogObject } from 'consola';
+import { formatWithOptions } from 'node:util';
+
+// When stdout is not a TTY (PM2, pipes, etc.) replace the fancy right-aligned
+// reporter with a plain left-justified one: "[Mon Mar 02 14:38:06] [type] msg"
+if (!process.stdout.isTTY) {
+    const plainReporter: ConsolaReporter = {
+        log(logObj: LogObject) {
+            const d = logObj.date ?? new Date();
+            const ts = `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+            const type = logObj.type !== 'log' ? `[${logObj.type}] ` : '';
+            const msg = formatWithOptions({}, ...logObj.args);
+            const stream = logObj.level < 2 ? process.stderr : process.stdout;
+            stream.write(`[${ts}] ${type}${msg}\n`);
+        }
+    };
+    consola.setReporters([plainReporter]);
+}
 import { chromium } from 'playwright-extra';
 import stealth from 'puppeteer-extra-plugin-stealth';
 import { execSync } from 'child_process';
