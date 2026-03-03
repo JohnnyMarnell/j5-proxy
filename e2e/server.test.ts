@@ -70,6 +70,28 @@ beforeAll(async () => {
                 );
             }
 
+            // wait-for test: span starts as "initial"; JS changes it to "updated"
+            // after 200ms and stamps data-ready on <body>.  Response is >1000 bytes
+            // so the proxy intercept filter captures it in non-render mode too.
+            if (url.pathname === '/wait-for-test') {
+                const padding = '<!-- ' + 'x'.repeat(1100) + ' -->';
+                const html = `<!DOCTYPE html>
+<html>
+<head><title>WaitFor Test</title><meta charset="utf-8"></head>
+<body>
+  <span id="status">initial</span>
+  <script>
+    setTimeout(function() {
+      document.getElementById('status').textContent = 'updated';
+      document.body.setAttribute('data-ready', 'true');
+    }, 200);
+  </script>
+  ${padding}
+</body>
+</html>`;
+                return new Response(html, { headers: { 'content-type': 'text/html; charset=utf-8' } });
+            }
+
             return new Response('Not Found', { status: 404 });
         },
     });
@@ -79,7 +101,7 @@ beforeAll(async () => {
     log('Starting proxy subprocess...');
     const projectRoot = import.meta.dir + '/..';
     proxyProc = spawn({
-        cmd: ['bun', 'index.ts', '-p', String(PROXY_PORT), '--idle', '60000', '--log-file', '/tmp/proxy-test.jsonl'],
+        cmd: ['bun', 'index.ts', '-p', String(PROXY_PORT), '--idle', '60000', '--log-file', '/tmp/proxy-test.jsonl', '--no-startup-notify'],
         cwd: projectRoot,
         stdout: VERBOSE ? 'inherit' : 'pipe',
         stderr: VERBOSE ? 'inherit' : 'pipe',
@@ -364,6 +386,80 @@ describe('e2e Zyte /v1/extract', () => {
 
         const decoded = Buffer.from(data.httpResponseBody, 'base64').toString('utf-8');
         expect(decoded).toContain('<h1>Hello from mock server</h1>');
+        log('  ✓ PASS\n');
+    }, 30000);
+});
+
+// --- WAIT-FOR TESTS ---
+// The /wait-for-test endpoint serves an HTML page where a <span id="status">
+// starts as "initial" and is changed to "updated" by a 200ms setTimeout, which
+// also stamps data-ready on <body>.
+//
+// Three modes are exercised:
+//   1. intercept (no render) — proxy captures the raw server response before JS
+//      runs → sees "initial", never "updated"
+//   2. render + selector      — proxy waits for [data-ready] to appear in DOM →
+//      sees "updated"
+//   3. render + settle        — proxy waits for networkidle then settles 500ms;
+//      the 200ms JS timer has fired by then → sees "updated"
+
+describe('e2e wait-for', () => {
+    test('intercept mode: sees raw "initial" content, not JS-mutated "updated"', async () => {
+        log('TEST: wait-for — intercept mode captures raw HTML before JS runs');
+        const start = Date.now();
+
+        const heartbeat = setInterval(() => log(`  ... still waiting (${Date.now() - start}ms)`), 5000);
+        const res = await fetch(proxyUrl('/wait-for-test'));
+        clearInterval(heartbeat);
+
+        const elapsed = Date.now() - start;
+        log(`  → status ${res.status} in ${elapsed}ms`);
+        expect(res.status).toBe(200);
+
+        const body = await res.text();
+        log(`  → body: ${body.length} bytes`);
+        expect(body).toContain('>initial<');
+        expect(body).not.toContain('>updated<');
+        log('  ✓ PASS\n');
+    }, 30000);
+
+    test('render + selector: waitForSelector([data-ready]) sees "updated"', async () => {
+        log('TEST: wait-for — render mode with selector=[data-ready] waits for JS mutation');
+        const start = Date.now();
+
+        const heartbeat = setInterval(() => log(`  ... still waiting (${Date.now() - start}ms)`), 5000);
+        const res = await fetch(proxyUrl('/wait-for-test'), {
+            headers: { 'x-proxy-options': 'render,selector=[data-ready],settle=0' },
+        });
+        clearInterval(heartbeat);
+
+        const elapsed = Date.now() - start;
+        log(`  → status ${res.status} in ${elapsed}ms`);
+        expect(res.status).toBe(200);
+
+        const body = await res.text();
+        log(`  → body: ${body.length} bytes`);
+        expect(body).toContain('>updated<');
+        log('  ✓ PASS\n');
+    }, 30000);
+
+    test('render + settle: networkidle + 500ms settle sees "updated"', async () => {
+        log('TEST: wait-for — render mode with settle=500 captures post-JS DOM');
+        const start = Date.now();
+
+        const heartbeat = setInterval(() => log(`  ... still waiting (${Date.now() - start}ms)`), 5000);
+        const res = await fetch(proxyUrl('/wait-for-test'), {
+            headers: { 'x-proxy-options': 'render,settle=500' },
+        });
+        clearInterval(heartbeat);
+
+        const elapsed = Date.now() - start;
+        log(`  → status ${res.status} in ${elapsed}ms`);
+        expect(res.status).toBe(200);
+
+        const body = await res.text();
+        log(`  → body: ${body.length} bytes`);
+        expect(body).toContain('>updated<');
         log('  ✓ PASS\n');
     }, 30000);
 });

@@ -24,7 +24,7 @@ import { chromium } from 'playwright-extra';
 import stealth from 'puppeteer-extra-plugin-stealth';
 import { execSync } from 'child_process';
 import notifier from 'node-notifier';
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, existsSync } from 'node:fs';
 import { parseProxyOptions, getCacheKey, summarizeBody, stripHopByHop, ResponseCache, validateZyteAuth } from './lib';
 import type { ProxyOptions, CachedResponse } from './lib';
 
@@ -38,10 +38,11 @@ cli
   .option('-t, --ttl <ms>', 'Cookie cache TTL (ms)', { default: 3600000 })
   .option('--log-html', 'Log HTML at each pipeline step to stdout', { default: false })
   .option('--log-file <path>', 'Path for the JSONL request log', { default: '/tmp/proxy.jsonl' })
-  .option('-i, --idle <ms>', 'Auto-shutdown after ms of inactivity', { default: 1800000 })
+  .option('-i, --idle <ms>', 'Auto-shutdown after ms of inactivity (0 to disable)', { default: 1800000 })
   .option('--throttle-interval <ms>', 'Cache responses for this many ms', { default: 5000 })
   .option('--throttle-regex <pattern>', 'Only cache URLs matching this regex', { default: '.*' })
   .option('--notify', 'Send OS notification on non-2XX responses (use --no-notify to disable)', { default: true })
+  .option('--startup-notify', 'Send OS notification on startup (use --no-startup-notify to disable)', { default: true })
   .help();
 
 const parsed = cli.parse();
@@ -56,6 +57,43 @@ const IDLE_TIMEOUT: number = Number(opts.idle);
 const THROTTLE_INTERVAL: number = Number(opts.throttleInterval);
 const THROTTLE_REGEX = new RegExp(opts.throttleRegex as string);
 const NOTIFY_ON_ERROR: boolean = opts.notify as boolean;
+const STARTUP_NOTIFY: boolean = opts.startupNotify as boolean;
+
+// --- STARTUP PRE-REQUISITE CHECKS ---
+function checkPrereqs(): void {
+    // Runtime: warn if not Bun (process.versions.bun is only set by Bun)
+    if (!process.versions.bun) {
+        const detected = Object.keys(process.versions)
+            .filter(k => k !== 'node' && k !== 'v8' && k !== 'uv' && k !== 'zlib' && k !== 'brotli' && k !== 'ares' && k !== 'modules' && k !== 'nghttp2' && k !== 'napi' && k !== 'llhttp' && k !== 'openssl' && k !== 'cldr' && k !== 'icu' && k !== 'tz' && k !== 'unicode')
+            .join(', ') || 'unknown';
+        consola.warn(`Not running under Bun (runtime: ${detected || 'node-like'}). Expected: bun index.ts`);
+    }
+
+    // Platform: warn if not macOS (Chrome cookie extraction is macOS-only)
+    if (process.platform !== 'darwin') {
+        consola.warn(`Running on ${process.platform}, not macOS. Chrome cookie extraction will likely fail. YMMV.`);
+    }
+
+    // Python: required for cookies.py
+    let pythonFound = false;
+    for (const cmd of ['python', 'python3']) {
+        try {
+            execSync(`${cmd} --version`, { stdio: 'pipe' });
+            pythonFound = true;
+            break;
+        } catch {}
+    }
+    if (!pythonFound) {
+        consola.error('Python not found. cookies.py requires Python to extract Chrome cookies. Install Python and retry.');
+        process.exit(1);
+    }
+
+    // cookies.py: must exist alongside index.ts
+    if (!existsSync(PYTHON_COOKIE_EXPORT)) {
+        consola.error(`cookies.py not found at ${PYTHON_COOKIE_EXPORT}. This script is required for Chrome cookie extraction.`);
+        process.exit(1);
+    }
+}
 
 // --- DEBOUNCED CLEANUP ERROR LOGGING ---
 let cleanupErrorCount = 0;
@@ -165,13 +203,13 @@ function resetIdleTimer() {
     lastRequestTime = Date.now();
 }
 
-const idleInterval = setInterval(() => {
+const idleInterval = IDLE_TIMEOUT > 0 ? setInterval(() => {
     if (Date.now() - lastRequestTime >= IDLE_TIMEOUT) {
         consola.warn(`No requests for ${IDLE_TIMEOUT / 1000}s — shutting down due to inactivity.`);
         shutdown('inactivity');
     }
-}, 10000);
-idleInterval.unref();
+}, 10000) : null;
+if (idleInterval) idleInterval.unref();
 
 // --- SHUTDOWN ---
 let shuttingDown = false;
@@ -179,7 +217,7 @@ let shuttingDown = false;
 async function shutdown(reason = 'signal') {
     if (shuttingDown) return;
     shuttingDown = true;
-    clearInterval(idleInterval);
+    if (idleInterval) clearInterval(idleInterval);
     consola.warn(`Shutting down (${reason})...`);
     notify('Proxy shutting down', `Reason: ${reason}`);
     if (browser) await browser.close();
@@ -684,18 +722,22 @@ app.get('/*', async (c) => {
 });
 
 // --- START ---
+checkPrereqs();
 initBrowser().then(() => {
     serve({
         fetch: app.fetch,
         port: PORT
     }, (info) => {
+        const idleNote = IDLE_TIMEOUT > 0
+            ? `⏱  Auto-shutdown after ${IDLE_TIMEOUT / 1000}s idle`
+            : `⏱  Idle auto-shutdown disabled`;
         consola.box(
             `🚀 Headless proxy running at http://localhost:${info.port}\n` +
             `📝 Logging requests to ${LOG_FILE}\n` +
-            `⏱  Auto-shutdown after ${IDLE_TIMEOUT / 1000}s idle\n` +
+            idleNote + '\n' +
             `⚡ Response throttle: ${THROTTLE_INTERVAL}ms, regex: ${opts.throttleRegex}`
         );
-        notify('Proxy started', `Listening on port ${info.port}`);
+        if (STARTUP_NOTIFY) notify('Proxy started', `Listening on port ${info.port}`);
     });
 });
 
