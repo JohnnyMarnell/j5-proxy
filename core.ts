@@ -140,6 +140,8 @@ export interface ScrapeLoggers {
     onJsonResponse?(status: number, bytes: number, ms: number, headers: Record<string, string>, body: string): void;
     /** Called at each HTML pipeline step when logHtml is enabled. */
     onHtmlStep?(label: string, html: string, ms: number): void;
+    /** Called when a screenshot is captured. */
+    onScreenshot?(path: string, ms: number): void;
     onSelectorFound?(selector: string): void;
     onSelectorTimeout?(selector: string, timeoutMs: number): void;
     onNetworkIdleTimeout?(): void;
@@ -152,9 +154,57 @@ export interface ScrapeOutput {
     status: number;
     body: string;
     headers: Record<string, string>;
+    screenshotPath?: string;
+}
+
+// Cloudflare challenge detection patterns
+function isCloudflareChallenge(html: string): boolean {
+    return !!(
+        html.includes('challenge-error-text') ||
+        html.includes('Just a moment') ||
+        html.includes('cf_clearance') ||  // CF challenge cookie indicator
+        html.includes('__cf_bm') ||        // CF bot management cookie
+        html.includes('Checking your browser') ||
+        html.includes('Enable JavaScript and cookies') ||
+        (html.includes('Cloudflare') && html.includes('Ray ID'))
+    );
 }
 
 function ms(startTime: number) { return Date.now() - startTime; }
+
+// Sanitize a URL for use as a filename
+function sanitizeUrlForFilename(url: string): string {
+    try {
+        const parsed = new URL(url);
+        const domain = parsed.hostname.replace(/\./g, '-');
+        const path = parsed.pathname.replace(/[^a-zA-Z0-9-]/g, '-').slice(0, 50);
+        return `j5-proxy_${domain}${path}`.slice(0, 100);
+    } catch {
+        return 'j5-proxy_screenshot';
+    }
+}
+
+// Screenshot capture — doesn't block request, errors are silently logged
+export async function captureScreenshotAsync(
+    page: any,
+    url: string,
+    reqId: number,
+    startTime: number,
+    loggers: ScrapeLoggers = SILENT,
+): Promise<string | undefined> {
+    try {
+        const sanitized = sanitizeUrlForFilename(url);
+        const timestamp = Date.now();
+        const filename = `/tmp/${sanitized}_${timestamp}.png`;
+        await page.screenshot({ path: filename, fullPage: true });
+        loggers.info(`[#${reqId}] Screenshot saved: ${filename}`);
+        loggers.onScreenshot?.(filename, ms(startTime));
+        return filename;
+    } catch (err: any) {
+        loggers.warn(`[#${reqId}] Screenshot failed: ${err.message}`);
+        return undefined;
+    }
+}
 
 export function attachResponseListeners(
     page: any,
@@ -202,7 +252,7 @@ export function attachResponseListeners(
             }
 
             if (isDocument && !proxyOpts.render) {
-                if (!text.includes('challenge-error-text') && !text.includes('Just a moment')) {
+                if (!isCloudflareChallenge(text)) {
                     if (text.length > 1000) {
                         if (proxyOpts.logHtml) {
                             loggers.onHtmlStep?.('intercepted-response', text, ms(startTime));
@@ -210,7 +260,7 @@ export function attachResponseListeners(
                         resolveCapture(text);
                     }
                 } else {
-                    loggers.info(`[#${reqId} +${ms(startTime)}ms] Cloudflare challenge detected, waiting...`);
+                    loggers.info(`[#${reqId} +${ms(startTime)}ms] Cloudflare challenge detected, waiting for bypass...`);
                 }
             }
         } catch {
@@ -270,21 +320,24 @@ export async function interceptPage(
     proxyOpts: ProxyOptions,
     captureHtmlPromise: Promise<string>,
     loggers: ScrapeLoggers = SILENT,
-): Promise<string> {
+): Promise<{ html: string; cloudflareDetected: boolean }> {
+    let cloudflareDetected = false;
     try {
-        return await Promise.race([
+        const html = await Promise.race([
             captureHtmlPromise,
             new Promise<string>((_, reject) =>
                 setTimeout(() => reject(new Error('Timeout waiting for real HTML (Cloudflare might be stuck)')), 25000)
             ),
         ]);
+        cloudflareDetected = false;
+        return { html, cloudflareDetected };
     } catch {
         loggers.warn(`[#${reqId} +${ms(startTime)}ms] Intercept timed out, falling back to live DOM.`);
         const rawHtml = await page.content();
         if (proxyOpts.logHtml) {
             loggers.onHtmlStep?.('fallback-dom', rawHtml, ms(startTime));
         }
-        return rawHtml;
+        return { html: rawHtml, cloudflareDetected };
     }
 }
 
@@ -331,11 +384,29 @@ export async function scrapeWithBrowser(
             return { isJson: true, status: jsonEarlyExit.status, body: jsonEarlyExit.body, headers: jsonEarlyExit.headers };
         }
 
-        const rawHtml = proxyOpts.render
-            ? await renderPage(page, reqId, startTime, proxyOpts, loggers)
-            : await interceptPage(page, reqId, startTime, proxyOpts, captureHtmlPromise, loggers);
+        let screenshotPath: string | undefined;
+        let cloudflareDetected = false;
+        let rawHtml: string;
 
-        return { isJson: false, status: 200, body: rawHtml, headers: { 'content-type': 'text/html; charset=utf-8' } };
+        if (proxyOpts.render) {
+            rawHtml = await renderPage(page, reqId, startTime, proxyOpts, loggers);
+        } else {
+            const result = await interceptPage(page, reqId, startTime, proxyOpts, captureHtmlPromise, loggers);
+            rawHtml = result.html;
+            cloudflareDetected = result.cloudflareDetected;
+            
+            // Log successful Cloudflare bypass
+            if (cloudflareDetected && !isCloudflareChallenge(rawHtml)) {
+                loggers.info(`[#${reqId} +${ms(startTime)}ms] ✓ Cloudflare challenge bypassed`);
+            }
+        }
+
+        // Capture screenshot before closing the page (if requested)
+        if (proxyOpts.screenshot) {
+            screenshotPath = await captureScreenshotAsync(page, targetUrl, reqId, startTime, loggers);
+        }
+
+        return { isJson: false, status: 200, body: rawHtml, headers: { 'content-type': 'text/html; charset=utf-8' }, screenshotPath };
     } finally {
         if (page) await page.close().catch(() => logCleanupError(warnCleanup));
         if (context) await context.close().catch(() => logCleanupError(warnCleanup));

@@ -79,6 +79,7 @@ describe('parseProxyOptions', () => {
             selector: null,
             settle: 1000,
             refreshCookies: false,
+            screenshot: false,
         });
     });
 

@@ -82,6 +82,7 @@ export async function scrape(url: string, options: ScrapeOptions = {}): Promise<
         selector: options.selector ?? null,
         settle: options.settle ?? 1000,
         refreshCookies: false,
+        screenshot: false,
     };
 
     const loggers: ScrapeLoggers = {

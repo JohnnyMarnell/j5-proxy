@@ -219,6 +219,7 @@ function buildRequestContext(c: import('hono').Context): RequestContext | Respon
         proxyOpts.logHtml ? 'log-html' : null,
         proxyOpts.selector ? `selector=${proxyOpts.selector}` : null,
         proxyOpts.refreshCookies ? 'refresh-cookies' : null,
+        proxyOpts.screenshot ? 'screenshot' : null,
         (!proxyOpts.render && !proxyOpts.selector && THROTTLE_REGEX.test(targetUrl)) ? 'cached' : null,
     ].filter(Boolean) as string[];
 
@@ -241,7 +242,7 @@ function tryCache(ctx: RequestContext): Response | null {
     return new Response(cached.body, { status: cached.status, headers: stripHopByHop(cached.headers) });
 }
 
-function logCompletion(ctx: RequestContext, responseStatus: number, responseBody: string, fromCache: boolean, responseError?: string) {
+function logCompletion(ctx: RequestContext, responseStatus: number, responseBody: string, fromCache: boolean, responseError?: string, screenshotPath?: string) {
     const duration = elapsed(ctx);
 
     if (!fromCache && !ctx.proxyOpts.render && !ctx.proxyOpts.selector && responseStatus === 200 && THROTTLE_REGEX.test(ctx.targetUrl)) {
@@ -254,12 +255,13 @@ function logCompletion(ctx: RequestContext, responseStatus: number, responseBody
         (!ctx.proxyOpts.render && !ctx.proxyOpts.selector && THROTTLE_REGEX.test(ctx.targetUrl) && responseStatus === 200) ? ' [cache-stored]' : '';
     const proxyOptsStr = ctx.tags.length ? ` [${ctx.tags.join(', ')}]` : '';
     const errorStr = responseError ? ` ERR: ${responseError}` : '';
+    const screenshotStr = screenshotPath ? ` 📸 ${screenshotPath}` : '';
     const truncUrl = ctx.targetUrl.substring(0, 70) + (ctx.targetUrl.length > 70 ? '...' : '');
     const bodySummary = (responseStatus < 200 || responseStatus >= 300) ? ` body=${summarizeBody(responseBody)}` : '';
 
     const isSuccess = responseStatus >= 200 && responseStatus < 300;
     const logFn = isSuccess ? consola.success : consola.warn;
-    logFn(`[#${ctx.reqId}] GET ${truncUrl} → ${responseStatus} (${responseBody.length}B) ${duration}ms${cacheStatus}${proxyOptsStr}${errorStr}${bodySummary}`);
+    logFn(`[#${ctx.reqId}] GET ${truncUrl} → ${responseStatus} (${responseBody.length}B) ${duration}ms${cacheStatus}${proxyOptsStr}${errorStr}${bodySummary}${screenshotStr}`);
     if (!isSuccess) notifyError(ctx.reqId, responseStatus, ctx.targetUrl);
 
     logToFile({
@@ -303,7 +305,7 @@ app.post('/:version{v\\d+}/extract', async (c) => {
     consola.info(`[#${reqId}] ZYTE POST /${version}/extract key=${apiKey.slice(0, 4)}… url=${targetUrl}`);
 
     const zyteProxyOpts: ProxyOptions = {
-        render: false, logHtml: false, wait: 20000, selector: null, settle: 1000, refreshCookies: false,
+        render: false, logHtml: false, wait: 20000, selector: null, settle: 1000, refreshCookies: false, screenshot: false,
     };
     const zyteLoggers: ScrapeLoggers = {
         info: (msg) => consola.info(msg),
@@ -355,6 +357,7 @@ app.get('/*', async (c) => {
     let responseStatus = 200;
     let responseBody = '';
     let responseError: string | undefined;
+    let screenshotPath: string | undefined;
 
     try {
         const cookies = cookiesAvailable ? getCookies(ctx.proxyOpts.refreshCookies, COOKIE_CACHE_TTL) : [];
@@ -373,6 +376,14 @@ app.get('/*', async (c) => {
                 response: { status, bodyLength: bytes, body, headers },
             }),
             onHtmlStep: (label, html, ms) => logHtmlStep(ctx.reqId, label, html, ctx.targetUrl, ms, ctx.reqHeaders, ctx.proxyOpts),
+            onScreenshot: (path, ms) => {
+                screenshotPath = path;
+                logToFile({
+                    ts: new Date().toISOString(), reqId: ctx.reqId, elapsed: ms, step: 'screenshot',
+                    request: { url: ctx.targetUrl, headers: ctx.reqHeaders, proxyOptions: ctx.proxyOpts },
+                    response: { screenshotPath: path },
+                });
+            },
         };
 
         const output = await scrapeWithBrowser(
@@ -398,7 +409,7 @@ app.get('/*', async (c) => {
         responseBody = `Error scraping page: ${error.message}`;
         return new Response(responseBody, { status: 500 });
     } finally {
-        logCompletion(ctx, responseStatus, responseBody, false, responseError);
+        logCompletion(ctx, responseStatus, responseBody, false, responseError, screenshotPath);
     }
 });
 

@@ -39,6 +39,8 @@ export interface ProxyOptions {
     settle: number;
     /** Force a fresh cookie extraction for this request. Errors loudly if cookies are unavailable. */
     refreshCookies: boolean;
+    /** Take a headless browser screenshot and save to /tmp. Async (doesn't block response). */
+    screenshot: boolean;
 }
 
 export function parseProxyOptions(header: string | undefined, globalLogHtml = false): ProxyOptions {
@@ -49,6 +51,7 @@ export function parseProxyOptions(header: string | undefined, globalLogHtml = fa
         selector: null,
         settle: 1000,
         refreshCookies: false,
+        screenshot: false,
     };
     if (!header) return opts;
     const parts = header.split(',').map(s => s.trim());
@@ -57,6 +60,7 @@ export function parseProxyOptions(header: string | undefined, globalLogHtml = fa
         if (lower === 'render') { opts.render = true; continue; }
         if (lower === 'log-html') { opts.logHtml = true; continue; }
         if (lower === 'refresh-cookies') { opts.refreshCookies = true; continue; }
+        if (lower === 'screenshot') { opts.screenshot = true; continue; }
         const [key, ...rest] = part.split('=');
         if (!key) continue;
         const val = rest.join('=');

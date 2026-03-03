@@ -91,10 +91,25 @@ curl http://localhost:8787/example.com
 
 ### Default mode — HTML interception
 
-Returns the first real HTML document response from the server, skipping Cloudflare challenge pages. A `<base>` tag is injected so relative URLs (CSS, JS, images) resolve against the original origin.
+Returns the first real HTML document response from the server, automatically detecting and waiting for Cloudflare challenge pages. A `<base>` tag is injected so relative URLs (CSS, JS, images) resolve against the original origin.
+
+**Cloudflare challenge detection** watches for:
+- `challenge-error-text` and `Just a moment` strings
+- Cloudflare challenge cookies (`cf_clearance`, `__cf_bm`)
+- `Checking your browser` and `Enable JavaScript and cookies` messages
+- `Cloudflare` + `Ray ID` combo (Cloudflare-specific headers)
+
+When a challenge is detected, the proxy logs:
+```
+ℹ [#1 +342ms] Cloudflare challenge detected, waiting for bypass...
+ℹ [#1 +2905ms] ✓ Cloudflare challenge bypassed
+```
+
+The browser automatically completes the challenge (typically 3-10 seconds), then the proxy captures and returns the real HTML.
 
 ```bash
 curl http://localhost:8787/example.com
+# Automatically detects, waits for, and bypasses Cloudflare challenges
 ```
 
 ### Render mode — full JS execution
@@ -120,6 +135,44 @@ Fine-tune render behavior per-request:
 # Wait up to 10s, require #content to appear, 2s settle
 curl -H "X-Proxy-Options: render, wait=10000, selector=#content, settle=2000" \
   http://localhost:8787/example.com
+```
+
+### Screenshot capture
+
+Take a headless browser screenshot for visual debugging or bot detector testing. The screenshot is captured **before** the response is sent, ensuring you can see exactly what the browser rendered at that moment.
+
+Screenshots are saved to `/tmp/<domain>_<timestamp>.png` and the path is included in both console and JSONL logs.
+
+```bash
+curl -H "X-Proxy-Options: screenshot" http://localhost:8787/example.com
+
+# Console output:
+✔ [#1] GET example.com → 200 (25688B) 775ms [screenshot] 📸 /tmp/example-com_1708452000123.png
+
+# JSONL log entry includes:
+# "screenshotPath": "/tmp/example-com_1708452000123.png"
+```
+
+**Combine with render mode for full JS execution + screenshot:**
+```bash
+curl -H "X-Proxy-Options: render, screenshot" http://localhost:8787/example.com
+```
+
+**Useful for testing against bot detectors:**
+- https://bot.sannysoft.com/
+- https://abrahamjuliot.github.io/creepjs/
+- https://www.browserscan.net/bot-detection
+- https://pixelscan.net/
+- https://browserleaks.com/
+
+Example workflow:
+```bash
+# Take screenshots before and after render mode
+curl -H "X-Proxy-Options: screenshot" http://localhost:8787/bot.sannysoft.com
+curl -H "X-Proxy-Options: render, screenshot" http://localhost:8787/bot.sannysoft.com
+
+# Check the logs
+tail -f /tmp/j5-proxy.jsonl | jq 'select(.screenshotPath) | {url: .url, screenshot: .screenshotPath}'
 ```
 
 ### JSON API proxying
@@ -174,6 +227,7 @@ Every request is logged to `/tmp/j5-proxy.jsonl` (configurable via `--log-file`)
 | `after-selector` | DOM after selector found (with `log-html` + `render` + `selector`) |
 | `final-rendered` | Final rendered DOM (with `log-html` + `render`) |
 | `fallback-dom` | Timeout fallback (with `log-html`) |
+| `screenshot` | Screenshot captured (with `screenshot` option) |
 
 Each entry includes:
 
@@ -196,6 +250,24 @@ Each entry includes:
 }
 ```
 
+Screenshot step:
+```json
+{
+  "ts": "2026-02-28T12:05:10.123Z",
+  "reqId": 1,
+  "elapsed": 5210,
+  "step": "screenshot",
+  "request": {
+    "url": "https://bot.sannysoft.com",
+    "headers": { "host": "localhost:8787", "x-proxy-options": "screenshot" },
+    "proxyOptions": { "screenshot": true, ... }
+  },
+  "response": {
+    "screenshotPath": "/tmp/bot-sannysoft-com_1708452010123.png"
+  }
+}
+```
+
 **Tailing examples:**
 
 ```bash
@@ -207,6 +279,9 @@ tail -f /tmp/j5-proxy.jsonl | jq 'select(.duration) | {id:.reqId, url:.url, ms:.
 
 # Filter JSON API responses
 tail -f /tmp/j5-proxy.jsonl | jq 'select(.step=="json-response") | {url:.request.url, ms:.elapsed, len:.response.bodyLength}'
+
+# Find screenshot steps
+tail -f /tmp/j5-proxy.jsonl | jq 'select(.step=="screenshot") | {id:.reqId, url:.request.url, screenshot:.response.screenshotPath}'
 ```
 
 ### Non-2XX response logging
@@ -224,10 +299,12 @@ All stdout and JSONL entries are tagged with `#reqId` and `+elapsedMs`, so concu
 
 ```
 ℹ [#1 +342ms] First response: 200 (48231 bytes)
+ℹ [#1 +2905ms] Cloudflare challenge detected, waiting for bypass...
+ℹ [#1 +5210ms] ✓ Cloudflare challenge bypassed
 ℹ [#2 +180ms] JSON response: 200 (4523 bytes)
 ✔ [#2] GET https://api.example.com/data → 200 (4523B) 195ms
 ⚠ [#1 +2905ms] Selector "#content" not found within 20000ms
-✔ [#1] GET https://example.com → 200 (52001B) 4112ms [render]
+✔ [#1] GET https://example.com → 200 (52001B) 4112ms [render, screenshot] 📸 /tmp/example-com_1708452000123.png
 ```
 
 ### Cookie injection
@@ -286,13 +363,14 @@ curl -H "X-Proxy-Options: refresh-cookies" http://localhost:8787/example.com
 Pass as a comma-separated header. All options are optional.
 
 ```
-X-Proxy-Options: render, log-html, wait=10000, selector=.main-content, settle=2000
+X-Proxy-Options: render, log-html, screenshot, wait=10000, selector=.main-content, settle=2000
 ```
 
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `render` | flag | off | Full JS render mode |
 | `log-html` | flag | off | Log HTML at each step to stdout |
+| `screenshot` | flag | off | Take a headless browser screenshot (async, saves to /tmp) |
 | `wait` | ms | `20000` | Max wait for networkidle / selector |
 | `selector` | CSS | none | Wait for selector before capturing DOM |
 | `settle` | ms | `1000` | Post-render settle time |
