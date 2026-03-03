@@ -71,11 +71,14 @@ describe('validateZyteAuth', () => {
 
 describe('parseProxyOptions', () => {
     test('returns defaults when no header', () => {
-        const opts = parseProxyOptions(undefined);
+        const { opts, errors } = parseProxyOptions(undefined);
+        expect(errors).toEqual([]);
         expect(opts).toEqual({
             render: false,
+            verify: false,
             logHtml: false,
             wait: 20000,
+            loadState: 'load',
             selector: null,
             settle: 1000,
             refreshCookies: false,
@@ -84,22 +87,22 @@ describe('parseProxyOptions', () => {
     });
 
     test('respects globalLogHtml default', () => {
-        const opts = parseProxyOptions(undefined, true);
+        const { opts } = parseProxyOptions(undefined, true);
         expect(opts.logHtml).toBe(true);
     });
 
     test('parses render flag', () => {
-        const opts = parseProxyOptions('render');
+        const { opts } = parseProxyOptions('render');
         expect(opts.render).toBe(true);
     });
 
     test('parses log-html flag', () => {
-        const opts = parseProxyOptions('log-html');
+        const { opts } = parseProxyOptions('log-html');
         expect(opts.logHtml).toBe(true);
     });
 
     test('parses wait, selector, settle', () => {
-        const opts = parseProxyOptions('render, wait=5000, selector=#main, settle=500');
+        const { opts } = parseProxyOptions('render, wait=5000, selector=#main, settle=500');
         expect(opts.render).toBe(true);
         expect(opts.wait).toBe(5000);
         expect(opts.selector).toBe('#main');
@@ -107,25 +110,40 @@ describe('parseProxyOptions', () => {
     });
 
     test('handles selector with = in value', () => {
-        const opts = parseProxyOptions('selector=[data-id=foo]');
+        const { opts } = parseProxyOptions('selector=[data-id=foo]');
         expect(opts.selector).toBe('[data-id=foo]');
     });
 
     test('parses refresh-cookies flag', () => {
-        const opts = parseProxyOptions('refresh-cookies');
+        const { opts } = parseProxyOptions('refresh-cookies');
         expect(opts.refreshCookies).toBe(true);
     });
 
     test('is case-insensitive for flags', () => {
-        const opts = parseProxyOptions('Render, Log-Html, Refresh-Cookies');
+        const { opts } = parseProxyOptions('Render, Log-Html, Refresh-Cookies');
         expect(opts.render).toBe(true);
         expect(opts.logHtml).toBe(true);
         expect(opts.refreshCookies).toBe(true);
     });
 
-    test('invalid wait falls back to default', () => {
-        const opts = parseProxyOptions('wait=abc');
+    test('invalid wait returns error and keeps default', () => {
+        const { opts, errors } = parseProxyOptions('wait=abc');
         expect(opts.wait).toBe(20000);
+        expect(errors.length).toBe(1);
+        expect(errors[0]).toContain('wait');
+    });
+
+    test('unknown option returns error', () => {
+        const { errors } = parseProxyOptions('rendur');
+        expect(errors.length).toBe(1);
+        expect(errors[0]).toContain('rendur');
+    });
+
+    test('invalid load-state returns error', () => {
+        const { opts, errors } = parseProxyOptions('load-state=invalid');
+        expect(opts.loadState).toBe('load'); // unchanged default
+        expect(errors.length).toBe(1);
+        expect(errors[0]).toContain('load-state');
     });
 });
 

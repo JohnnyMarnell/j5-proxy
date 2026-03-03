@@ -18,6 +18,11 @@ export type BrowserHandle =
 // builds up naturally (history, storage, etc.) which helps with fingerprinting.
 const CHROME_PROFILE_DIR = join(tmpdir(), 'j5-proxy-chrome-profile');
 
+export async function closeBrowser(handle: BrowserHandle): Promise<void> {
+    if (handle.kind === 'chrome') await handle.context.close().catch(() => {});
+    else await handle.browser.close().catch(() => {});
+}
+
 export async function launchBrowser(useChrome = false, initialCookies: any[] = []): Promise<BrowserHandle> {
     if (useChrome) {
         const context = await chromium.launchPersistentContext(CHROME_PROFILE_DIR, {

@@ -18,6 +18,7 @@ import { Hono } from 'hono';
 import { serve } from '@hono/node-server';
 import {
     launchBrowser,
+    closeBrowser,
     scrapeWithBrowser,
     getCookies,
     cookiesAvailable,
@@ -77,8 +78,10 @@ export async function scrape(url: string, options: ScrapeOptions = {}): Promise<
 
     const proxyOpts: ProxyOptions = {
         render: options.render ?? false,
+        verify: false,
         logHtml: options.logHtml ?? false,
         wait: options.wait ?? 20000,
+        loadState: 'load',
         selector: options.selector ?? null,
         settle: options.settle ?? 1000,
         refreshCookies: false,
@@ -94,9 +97,9 @@ export async function scrape(url: string, options: ScrapeOptions = {}): Promise<
     };
 
     const cookies = options.cookies ?? (cookiesAvailable ? getCookies() : []);
-    const browser = await launchBrowser();
+    const handle = await launchBrowser();
     try {
-        const output = await scrapeWithBrowser(browser, reqId, startTime, normalizedUrl, proxyOpts, cookies, loggers);
+        const output = await scrapeWithBrowser(handle, reqId, startTime, normalizedUrl, proxyOpts, cookies, loggers);
 
         if (output.isJson) {
             return { html: output.body, status: output.status, url: normalizedUrl, isJson: true, headers: output.headers };
@@ -106,7 +109,7 @@ export async function scrape(url: string, options: ScrapeOptions = {}): Promise<
         const html = output.body.replace(/<head([^>]*)>/i, `<head$1>${baseTag}`);
         return { html, status: output.status, url: normalizedUrl, isJson: false, headers: output.headers };
     } finally {
-        await browser.close();
+        await closeBrowser(handle);
     }
 }
 
@@ -153,7 +156,7 @@ export async function createProxy(config: ProxyConfig = {}): Promise<ProxyServer
     const cookieTtl = config.cookieTtl ?? 3_600_000;
 
     const responseCache = new ResponseCache(throttleInterval);
-    const browser = await launchBrowser();
+    const handle = await launchBrowser();
     let reqCounter = 0;
 
     const app = new Hono();
@@ -167,7 +170,7 @@ export async function createProxy(config: ProxyConfig = {}): Promise<ProxyServer
         try { targetOrigin = new URL(targetUrl).origin; }
         catch { return c.text('Invalid URL', 400); }
 
-        const proxyOpts = parseProxyOptions(c.req.header('x-proxy-options'), config.logHtml ?? false);
+        const { opts: proxyOpts } = parseProxyOptions(c.req.header('x-proxy-options'), config.logHtml ?? false);
         const reqId = ++reqCounter;
         const startTime = Date.now();
 
@@ -183,7 +186,7 @@ export async function createProxy(config: ProxyConfig = {}): Promise<ProxyServer
         const cookies = cookiesAvailable ? getCookies(false, cookieTtl) : [];
 
         try {
-            const output = await scrapeWithBrowser(browser, reqId, startTime, targetUrl, proxyOpts, cookies);
+            const output = await scrapeWithBrowser(handle, reqId, startTime, targetUrl, proxyOpts, cookies);
 
             if (output.isJson) {
                 return new Response(output.body, { status: output.status, headers: stripHopByHop(output.headers) });
@@ -192,7 +195,7 @@ export async function createProxy(config: ProxyConfig = {}): Promise<ProxyServer
             const baseTag = `<base href="${targetOrigin}/">`;
             const html = output.body.replace(/<head([^>]*)>/i, `<head$1>${baseTag}`);
 
-            if (!proxyOpts.render && !proxyOpts.selector && output.status === 200 && throttleRegex.test(targetUrl)) {
+            if (!proxyOpts.render && !proxyOpts.selector && !proxyOpts.verify && output.status === 200 && throttleRegex.test(targetUrl)) {
                 responseCache.set(cacheKey, html, 200, { 'content-type': 'text/html; charset=utf-8' });
             }
 
@@ -208,7 +211,7 @@ export async function createProxy(config: ProxyConfig = {}): Promise<ProxyServer
                 resolve({
                     port: info.port,
                     stop: async () => {
-                        await browser.close();
+                        await closeBrowser(handle);
                         await new Promise<void>((res) => server.close(() => res()));
                     },
                 });
