@@ -134,7 +134,8 @@ export function getCookies(forceRefresh = false, ttl = 3_600_000): any[] {
 export interface ScrapeLoggers {
     info(msg: string): void;
     warn(msg: string): void;
-    verbose?: boolean;
+    /** 0 = silent, 1 = requests+aborts, 2 = +truncated HTML steps, 3 = +full HTML */
+    verbosity?: number;
     /** Called on the first document response from the browser. */
     onFirstResponse?(status: number, bytes: number, ms: number): void;
     /** Called when an application/json response is detected. */
@@ -202,21 +203,58 @@ export function attachResponseListeners(
     targetUrl: string,
     proxyOpts: ProxyOptions,
     loggers: ScrapeLoggers = SILENT,
-): { jsonResponsePromise: Promise<{ body: string; headers: Record<string, string>; status: number }>; captureHtmlPromise: Promise<string> } {
+): { jsonResponsePromise: Promise<{ body: string; headers: Record<string, string>; status: number }>; captureHtmlPromise: Promise<string>; skipCounts: Record<string, number> } {
     let firstResponseLogged = false;
     let resolveJson!: (r: { body: string; headers: Record<string, string>; status: number }) => void;
     const jsonResponsePromise = new Promise<{ body: string; headers: Record<string, string>; status: number }>((r) => { resolveJson = r; });
     let resolveCapture!: (html: string) => void;
-    const captureHtmlPromise = new Promise<string>((r) => { resolveCapture = r; });
+    let rejectCapture!: (err: Error) => void;
+    const captureHtmlPromise = new Promise<string>((resolve, reject) => { resolveCapture = resolve; rejectCapture = reject; });
+    const skipCounts: Record<string, number> = {};
+    const verbosity = loggers.verbosity ?? 0;
 
-    // Verbose: log every request/response so nothing is hidden
-    if (loggers.verbose) {
+    // -vvv: log every request as it fires (including those about to be skipped)
+    if (verbosity >= 3) {
         page.on('request', (req: any) => {
-            loggers.info?.(`[#${reqId} +${ms(startTime)}ms] → ${req.resourceType()} ${req.method()} ${req.url().substring(0, 120)}`);
+            loggers.info(`[#${reqId} +${ms(startTime)}ms] → ${req.resourceType()} ${req.url().substring(0, 120)}`);
         });
+    } else if (verbosity >= 1) {
+        // -v / -vv: only log document requests (skips will surface via requestfailed)
+        page.on('request', (req: any) => {
+            if (req.resourceType() === 'document') {
+                loggers.info(`[#${reqId} +${ms(startTime)}ms] → document ${req.url().substring(0, 120)}`);
+            }
+        });
+    }
+
+    page.on('requestfailed', (req: any) => {
+        const reason = req.failure()?.errorText ?? 'unknown';
+        const aborted = reason === 'net::ERR_ABORTED';
+        const type = req.resourceType();
+        const url = req.url().substring(0, 120);
+
+        if (aborted) {
+            // Our intentional skip — accumulate for summary (-v) or log individually (-vv+)
+            if (verbosity >= 2) {
+                loggers.info(`[#${reqId} +${ms(startTime)}ms] ✗ skip ${type} ${url}`);
+            } else if (verbosity >= 1) {
+                skipCounts[type] = (skipCounts[type] ?? 0) + 1;
+            }
+        } else {
+            // Real failure — always warn regardless of verbosity
+            if (type === 'document') {
+                loggers.warn(`[#${reqId} +${ms(startTime)}ms] ✗ DOCUMENT FAILED (${reason}) ${url}`);
+                rejectCapture(new Error(`Document request failed: ${reason} ${req.url()}`));
+            } else {
+                loggers.warn(`[#${reqId} +${ms(startTime)}ms] ✗ failed (${reason}) ${type} ${url}`);
+            }
+        }
+    });
+
+    if (verbosity >= 1) {
         page.on('response', (res: any) => {
             const loc = res.headers()['location'] ? ` → ${res.headers()['location']}` : '';
-            loggers.info?.(`[#${reqId} +${ms(startTime)}ms] ← ${res.status()} ${res.request().resourceType()} ${res.url().substring(0, 120)}${loc}`);
+            loggers.info(`[#${reqId} +${ms(startTime)}ms] ← ${res.status()} ${res.request().resourceType()} ${res.url().substring(0, 120)}${loc}`);
         });
     }
 
@@ -264,7 +302,7 @@ export function attachResponseListeners(
         }
     });
 
-    return { jsonResponsePromise, captureHtmlPromise };
+    return { jsonResponsePromise, captureHtmlPromise, skipCounts };
 }
 
 export async function renderPage(
@@ -362,9 +400,22 @@ export async function scrapeWithBrowser(
 
         page = await context.newPage();
 
-        const { jsonResponsePromise, captureHtmlPromise } = attachResponseListeners(
+        const { jsonResponsePromise, captureHtmlPromise, skipCounts } = attachResponseListeners(
             page, reqId, startTime, targetUrl, proxyOpts, loggers
         );
+
+        // Intercept mode: abort everything except documents before it goes on the wire.
+        // No state, no bookkeeping — just kill non-document requests immediately.
+        if (!proxyOpts.render) {
+            await page.route('**/*', (route: any) => {
+                route.request().resourceType() === 'document' ? route.continue() : route.abort('aborted');
+            });
+        }
+
+        // Close the page as soon as we have the HTML — don't wait for goto/finally.
+        if (!proxyOpts.render) {
+            captureHtmlPromise.then(() => page.close().catch(() => {}));
+        }
 
         await page.goto(targetUrl, { waitUntil: 'commit', timeout: 30000 });
 
@@ -384,6 +435,10 @@ export async function scrapeWithBrowser(
             rawHtml = await renderPage(page, reqId, startTime, proxyOpts, loggers);
         } else {
             rawHtml = await interceptPage(page, reqId, startTime, proxyOpts, captureHtmlPromise, loggers);
+            if ((loggers.verbosity ?? 0) === 1 && Object.keys(skipCounts).length > 0) {
+                const summary = Object.entries(skipCounts).map(([t, n]) => `${t}×${n}`).join(', ');
+                loggers.info(`[#${reqId} +${ms(startTime)}ms] ✗ skipped: ${summary}`);
+            }
         }
 
         // Capture screenshot before closing the page (if requested)

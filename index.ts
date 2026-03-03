@@ -2,7 +2,8 @@
 /// <reference lib="dom" />
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
-import { cac } from 'cac';
+import yargs from 'yargs';
+import { hideBin } from 'yargs/helpers';
 import consola, { type ConsolaReporter, type LogObject } from 'consola';
 import { formatWithOptions } from 'node:util';
 import { appendFileSync } from 'node:fs';
@@ -43,30 +44,30 @@ if (!process.stdout.isTTY) {
 }
 
 // --- CLI ARGUMENT PARSING ---
-const cli = cac('j5-proxy');
+// -v / -vv / -vvv: verbosity levels (yargs .count() tallies repetitions)
+//   -v   log all requests, aborts, responses
+//   -vv  same + HTML at pipeline steps (truncated to 500 chars)
+//   -vvv same + full HTML body
+const opts = yargs(hideBin(process.argv))
+    .scriptName('j5-proxy')
+    .option('port',             { alias: 'p', type: 'number',  default: 8787,          describe: 'Server port' })
+    .option('ttl',              { alias: 't', type: 'number',  default: 3600000,        describe: 'Cookie cache TTL (ms)' })
+    .option('log-html',         {             type: 'boolean', default: false,          describe: 'Log HTML at each pipeline step (truncated; -vvv for full)' })
+    .option('log-file',         {             type: 'string',  default: '/tmp/j5-proxy.jsonl', describe: 'Path for the JSONL request log' })
+    .option('idle',             { alias: 'i', type: 'number',  default: 1800000,        describe: 'Auto-shutdown after ms of inactivity (0 to disable)' })
+    .option('throttle-interval',{             type: 'number',  default: 5000,           describe: 'Cache responses for this many ms' })
+    .option('throttle-regex',   {             type: 'string',  default: '.*',           describe: 'Only cache URLs matching this regex' })
+    .option('notify',           {             type: 'boolean', default: true,           describe: 'OS notification on non-2XX responses (--no-notify to disable)' })
+    .option('startup-notify',   {             type: 'boolean', default: true,           describe: 'OS notification on startup (--no-startup-notify to disable)' })
+    .option('refresh-cookies',  {             type: 'boolean', default: false,          describe: 'Force fresh cookie extraction on startup' })
+    .option('v',                {             count: true,                              describe: 'Verbosity: -v requests/aborts, -vv +truncated HTML, -vvv +full HTML' })
+    .help()
+    .parseSync();
 
-cli
-    .option('-p, --port <port>', 'Server port', { default: 8787 })
-    .option('-t, --ttl <ms>', 'Cookie cache TTL (ms)', { default: 3600000 })
-    .option('--log-html', 'Log HTML at each pipeline step to stdout', { default: false })
-    .option('-v, --verbose', 'Log full HTML at every pipeline step (implies --log-html)', { default: false })
-    .option('--log-file <path>', 'Path for the JSONL request log', { default: '/tmp/j5-proxy.jsonl' })
-    .option('-i, --idle <ms>', 'Auto-shutdown after ms of inactivity (0 to disable)', { default: 1800000 })
-    .option('--throttle-interval <ms>', 'Cache responses for this many ms', { default: 5000 })
-    .option('--throttle-regex <pattern>', 'Only cache URLs matching this regex', { default: '.*' })
-    .option('--notify', 'Send OS notification on non-2XX responses (use --no-notify to disable)', { default: true })
-    .option('--startup-notify', 'Send OS notification on startup (use --no-startup-notify to disable)', { default: true })
-    .option('--refresh-cookies', 'Force fresh cookie extraction on startup — errors loudly if unavailable', { default: false })
-    .help();
-
-const parsed = cli.parse();
-if (parsed.options.help) process.exit(0);
-const opts = parsed.options;
-
-const PORT: number = Number(opts.port);
-const COOKIE_CACHE_TTL: number = Number(opts.ttl);
-const VERBOSE: boolean = opts.verbose as boolean;
-const GLOBAL_LOG_HTML: boolean = VERBOSE || (opts.logHtml as boolean);
+const PORT: number = opts.port;
+const COOKIE_CACHE_TTL: number = opts.ttl;
+const VERBOSITY: number = opts.v as number;
+const GLOBAL_LOG_HTML: boolean = VERBOSITY >= 2 || opts.logHtml;
 const LOG_FILE: string = opts.logFile as string;
 const IDLE_TIMEOUT: number = Number(opts.idle);
 const THROTTLE_INTERVAL: number = Number(opts.throttleInterval);
@@ -129,7 +130,7 @@ function logToFile(entry: Record<string, any>) {
 
 // --- HTML STEP LOGGER ---
 function logHtmlStep(reqId: number, label: string, html: string, url: string, elapsedMs: number, reqHeaders: Record<string, string>, proxyOpts: ProxyOptions) {
-    const body = VERBOSE ? html : (html.length > 500 ? html.substring(0, 500) + `... (${html.length} chars total)` : html);
+    const body = VERBOSITY >= 3 ? html : (html.length > 500 ? html.substring(0, 500) + `... (${html.length} chars total)` : html);
     consola.info(`\n[#${reqId} +${elapsedMs}ms HTML:${label}] ${url}\n${'─'.repeat(60)}\n${body}\n${'─'.repeat(60)}`);
     logToFile({
         ts: new Date().toISOString(),
@@ -367,7 +368,7 @@ app.get('/*', async (c) => {
         const loggers: ScrapeLoggers = {
             info: (msg) => consola.info(msg),
             warn: (msg) => consola.warn(msg),
-            verbose: VERBOSE,
+            verbosity: VERBOSITY,
             onFirstResponse: (status, bytes, ms) => logToFile({
                 ts: new Date().toISOString(), reqId: ctx.reqId, elapsed: ms, step: 'first-response',
                 request: { url: ctx.targetUrl, headers: ctx.reqHeaders, proxyOptions: ctx.proxyOpts },
