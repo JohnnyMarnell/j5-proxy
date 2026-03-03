@@ -45,6 +45,7 @@
   "packageManager": "bun@1.3.9",
   "scripts": {
     "dev": "bun --hot index.ts",
+    "bot": "bash ./bin/bot-test.sh",
     "typecheck": "tsc --noEmit",
     "build": "bun build --target=node --outdir=dist index.ts api.ts",
     "build:types": "tsc --project tsconfig.build.json",

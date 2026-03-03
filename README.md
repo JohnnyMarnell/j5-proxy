@@ -57,6 +57,34 @@ bun --hot index.ts
 j5-proxy
 ```
 
+### Bot detection testing
+
+Test the proxy against major bot detectors in parallel:
+
+```bash
+# Start the proxy in one terminal
+bun --hot index.ts
+
+# In another terminal, run the bot detector test suite
+bun run bot
+# or
+bash ./bin/bot-test.sh
+```
+
+This will:
+1. Clear previous screenshots from `/tmp`
+2. Scrape all 5 bot detector sites **in parallel** with screenshots
+3. Automatically open all screenshots in your default image viewer
+
+Sites tested:
+- https://bot.sannysoft.com/
+- https://abrahamjuliot.github.io/creepjs/
+- https://www.browserscan.net/bot-detection
+- https://pixelscan.net/
+- https://browserleaks.com/
+
+Screenshots are saved to `/tmp/j5-proxy_*.png` for inspection.
+
 ### CLI flags
 
 | Flag | Default | Description |
