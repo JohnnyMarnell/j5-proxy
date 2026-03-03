@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/JohnnyMarnell/proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/JohnnyMarnell/proxy/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/j5-proxy)](https://www.npmjs.com/package/j5-proxy)
-[![license](https://img.shields.io/github/license/JohnnyMarnell/proxy)](LICENSE)
+[![license](https://img.shields.io/github/license/JohnnyMarnell/j5-proxy)](LICENSE)
 
 Proxy utility that can seamlessly pass Cloudfare bot detection and automatically inject cookies.
 
