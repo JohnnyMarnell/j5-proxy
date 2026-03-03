@@ -8,13 +8,30 @@ import { fileURLToPath } from 'node:url';
 import type { ProxyOptions } from './lib';
 
 
-export const STEALTH_UA =
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-
 // --- BROWSER ---
 
-export async function launchBrowser(): Promise<any> {
-    return chromium.launch({ headless: true });
+export type BrowserHandle =
+    | { kind: 'chromium'; browser: any }
+    | { kind: 'chrome'; context: any };
+
+// Persistent Chrome profile dir — reused across restarts so the profile
+// builds up naturally (history, storage, etc.) which helps with fingerprinting.
+const CHROME_PROFILE_DIR = join(tmpdir(), 'j5-proxy-chrome-profile');
+
+export async function launchBrowser(useChrome = false, initialCookies: any[] = []): Promise<BrowserHandle> {
+    if (useChrome) {
+        const context = await chromium.launchPersistentContext(CHROME_PROFILE_DIR, {
+            channel: 'chrome',
+            headless: true,
+            viewport: null,
+            // No custom userAgent or headers — let Chrome identify itself naturally
+        });
+        if (initialCookies.length > 0) await context.addCookies(initialCookies);
+        return { kind: 'chrome', context };
+    }
+
+    const browser = await chromium.launch({ headless: true });
+    return { kind: 'chromium', browser };
 }
 
 // --- CLEANUP ERROR DEBOUNCE ---
@@ -437,7 +454,7 @@ function logCompletedCounts(counts: Record<string, number>, reqId: number, start
  * Logging is fully optional via the `loggers` parameter.
  */
 export async function scrapeWithBrowser(
-    browser: any,
+    handle: BrowserHandle,
     reqId: number,
     startTime: number,
     targetUrl: string,
@@ -447,13 +464,21 @@ export async function scrapeWithBrowser(
     warnCleanup: (msg: string) => void = () => {},
 ): Promise<ScrapeOutput> {
     let context: any;
+    let ownContext = false; // whether we created the context and should close it
     let page: any;
     try {
-        context = await browser.newContext({
-            userAgent: STEALTH_UA,
-            viewport: { width: 1280, height: 720 },
-        });
-        if (cookies.length > 0) await context.addCookies(cookies);
+        if (handle.kind === 'chrome') {
+            context = handle.context;
+            // Refresh cookies into the persistent context if explicitly requested
+            if (proxyOpts.refreshCookies && cookies.length > 0) {
+                await context.clearCookies();
+                await context.addCookies(cookies);
+            }
+        } else {
+            context = await handle.browser.newContext({ viewport: { width: 1280, height: 720 } });
+            if (cookies.length > 0) await context.addCookies(cookies);
+            ownContext = true;
+        }
 
         page = await context.newPage();
 
@@ -525,6 +550,6 @@ export async function scrapeWithBrowser(
         return { isJson: false, status: 200, body: rawHtml, headers: { 'content-type': 'text/html; charset=utf-8' }, screenshotPath };
     } finally {
         if (page) await page.close().catch(() => logCleanupError(warnCleanup));
-        if (context) await context.close().catch(() => logCleanupError(warnCleanup));
+        if (ownContext && context) await context.close().catch(() => logCleanupError(warnCleanup));
     }
 }

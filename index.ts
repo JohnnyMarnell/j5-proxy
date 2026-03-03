@@ -60,6 +60,7 @@ const opts = yargs(hideBin(process.argv))
     .option('notify',           {             type: 'boolean', default: true,           describe: 'OS notification on non-2XX responses (--no-notify to disable)' })
     .option('startup-notify',   {             type: 'boolean', default: true,           describe: 'OS notification on startup (--no-startup-notify to disable)' })
     .option('refresh-cookies',  {             type: 'boolean', default: false,          describe: 'Force fresh cookie extraction on startup' })
+    .option('chrome',           {             type: 'boolean', default: false,          describe: 'Use real Chrome (persistent context) instead of Chromium' })
     .option('v',                {             count: true,                              describe: 'Verbosity: -v requests/aborts, -vv +truncated HTML, -vvv +full HTML' })
     .help()
     .parseSync();
@@ -75,6 +76,7 @@ const THROTTLE_REGEX = new RegExp(opts.throttleRegex as string);
 const NOTIFY_ON_ERROR: boolean = opts.notify as boolean;
 const STARTUP_NOTIFY: boolean = opts.startupNotify as boolean;
 const REFRESH_COOKIES_ON_START: boolean = opts.refreshCookies as boolean;
+const USE_CHROME: boolean = opts.chrome as boolean;
 
 // --- STARTUP PRE-REQUISITE CHECKS ---
 function checkPrereqs(): void {
@@ -165,7 +167,7 @@ async function shutdown(reason = 'signal') {
     if (idleInterval) clearInterval(idleInterval);
     consola.warn(`Shutting down (${reason})...`);
     notify('j5-proxy shutting down', `Reason: ${reason}`);
-    if (browser) await browser.close();
+    if (browser) await browser.close().catch(() => {});
     process.exit(0);
 }
 
@@ -425,9 +427,11 @@ app.get('/*', async (c) => {
 checkPrereqs();
 
 async function initBrowser() {
-    consola.start('Booting Chromium...');
-    browser = await launchBrowser();
-    consola.ready('Browser ready.');
+    consola.start(`Booting ${USE_CHROME ? 'Chrome (persistent context)' : 'Chromium'}...`);
+    const initialCookies = USE_CHROME && cookiesAvailable ? getCookies(false, COOKIE_CACHE_TTL) : [];
+    browser = await launchBrowser(USE_CHROME, initialCookies);
+    const cookieNote = USE_CHROME ? ` — ${initialCookies.length} cookie(s) loaded into persistent context` : '';
+    consola.ready(`${USE_CHROME ? 'Chrome' : 'Chromium'} ready${cookieNote}.`);
 }
 
 initBrowser().then(() => {
@@ -437,6 +441,7 @@ initBrowser().then(() => {
             : `⏱  Idle auto-shutdown disabled`;
         consola.box(
             `🚀 j5-proxy running at http://localhost:${info.port}\n` +
+            `🌐 Browser: ${USE_CHROME ? 'Chrome (persistent context, --chrome)' : 'Chromium (default)'}\n` +
             `📝 Logging requests to ${LOG_FILE}\n` +
             idleNote + '\n' +
             `⚡ Response throttle: ${THROTTLE_INTERVAL}ms, regex: ${opts.throttleRegex}\n` +

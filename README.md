@@ -129,6 +129,31 @@ If CF ever serves a blocking "Just a moment" challenge page (rare with a real Ch
 
 ---
 
+## Browser selection
+
+By default j5-proxy uses **Chromium** (bundled with patchright, binary-level stealth patches applied). This works well for most sites.
+
+Use `--chrome` to switch to **real Chrome** with a persistent browser context:
+
+```bash
+j5-proxy --chrome
+```
+
+| | Chromium (default) | Chrome (`--chrome`) |
+|---|---|---|
+| Binary | Bundled Chromium | System Chrome (`channel: chrome`) |
+| Context | Fresh per request | Persistent across all requests |
+| Profile dir | n/a | `$TMPDIR/j5-proxy-chrome-profile` |
+| Viewport | 1280×720 | OS default (`viewport: null`) |
+| User agent | Chrome UA (patchright) | Real Chrome UA |
+| Cookies | Injected per request | Injected at launch, cleared on refresh |
+
+The persistent profile accumulates browsing history and storage across proxy restarts, which can help with fingerprint legitimacy. Install Chrome if not already present:
+
+```bash
+npx patchright install chrome
+```
+
 ## Cloudflare detection
 
 The proxy uses a real Chromium binary with the stealth plugin and injects your local Chrome cookies. This combination means CF typically sees a legitimate browser fingerprint and skips the interactive challenge entirely, going straight to background verification (CF JSD).
@@ -163,6 +188,7 @@ bun --hot index.ts --help
 | `--notify` / `--no-notify` | `true` | OS notification on non-2XX responses |
 | `--startup-notify` / `--no-startup-notify` | `true` | OS notification on startup |
 | `--refresh-cookies` | `false` | Force fresh cookie extraction on startup |
+| `--chrome` | `false` | Use real Chrome with persistent context instead of Chromium |
 | `-v` / `-vv` / `-vvv` | off | Verbosity (see below) |
 
 ### Verbosity levels
