@@ -156,20 +156,8 @@ export interface ScrapeOutput {
     body: string;
     headers: Record<string, string>;
     screenshotPath?: string;
-    cloudflareDetected?: boolean;
 }
 
-// Cloudflare challenge detection patterns (relaxed to avoid false positives)
-function isCloudflareChallenge(html: string): boolean {
-    return !!(
-        html.includes('challenge-error-text') ||      // interactive challenge page
-        html.includes('Just a moment') ||             // interactive challenge title
-        html.includes('Checking your browser') ||     // interactive challenge message
-        (html.includes('Enable JavaScript') && html.includes('cookies')) || // interactive message
-        html.includes('challenge-platform/scripts/jsd') || // CF JSD (invisible) challenge
-        html.includes('__CF$cv$params')               // CF JSD params object
-    );
-}
 
 function ms(startTime: number) { return Date.now() - startTime; }
 
@@ -214,13 +202,12 @@ export function attachResponseListeners(
     targetUrl: string,
     proxyOpts: ProxyOptions,
     loggers: ScrapeLoggers = SILENT,
-): { jsonResponsePromise: Promise<{ body: string; headers: Record<string, string>; status: number }>; captureHtmlPromise: Promise<string>; cfDetected: { value: boolean } } {
+): { jsonResponsePromise: Promise<{ body: string; headers: Record<string, string>; status: number }>; captureHtmlPromise: Promise<string> } {
     let firstResponseLogged = false;
     let resolveJson!: (r: { body: string; headers: Record<string, string>; status: number }) => void;
     const jsonResponsePromise = new Promise<{ body: string; headers: Record<string, string>; status: number }>((r) => { resolveJson = r; });
     let resolveCapture!: (html: string) => void;
     const captureHtmlPromise = new Promise<string>((r) => { resolveCapture = r; });
-    const cfDetected = { value: false };
 
     // Verbose: log every request/response so nothing is hidden
     if (loggers.verbose) {
@@ -234,12 +221,6 @@ export function attachResponseListeners(
     }
 
     page.on('response', async (response: any) => {
-        // CF JSD oneshot fires from a hidden iframe, check before frame filter
-        if (response.url().includes('/jsd/oneshot')) {
-            cfDetected.value = true;
-            loggers.info(`[#${reqId} +${ms(startTime)}ms] ✓ CF JSD challenge verified`);
-        }
-
         if (response.request().frame() !== page.mainFrame()) return;
 
         const contentType = response.headers()['content-type'] || '';
@@ -271,16 +252,11 @@ export function attachResponseListeners(
             }
 
             if (isDocument && !proxyOpts.render) {
-                if (!isCloudflareChallenge(text)) {
-                    if (text.length > 1000) {
-                        if (proxyOpts.logHtml) {
-                            loggers.onHtmlStep?.('intercepted-response', text, ms(startTime));
-                        }
-                        resolveCapture(text);
+                if (text.length > 1000) {
+                    if (proxyOpts.logHtml) {
+                        loggers.onHtmlStep?.('intercepted-response', text, ms(startTime));
                     }
-                } else {
-                    cfDetected.value = true;
-                    loggers.info(`[#${reqId} +${ms(startTime)}ms] Cloudflare challenge detected, waiting for bypass...`);
+                    resolveCapture(text);
                 }
             }
         } catch {
@@ -288,7 +264,7 @@ export function attachResponseListeners(
         }
     });
 
-    return { jsonResponsePromise, captureHtmlPromise, cfDetected };
+    return { jsonResponsePromise, captureHtmlPromise };
 }
 
 export async function renderPage(
@@ -386,20 +362,7 @@ export async function scrapeWithBrowser(
 
         page = await context.newPage();
 
-        // In intercept mode, block non-essential resources (images, fonts, media).
-        // Scripts/XHR/fetch are allowed so CF JSD challenges can still complete.
-        if (!proxyOpts.render) {
-            await page.route('**/*', (route: any) => {
-                const type = route.request().resourceType();
-                if (['image', 'font', 'media'].includes(type)) {
-                    route.abort();
-                } else {
-                    route.continue();
-                }
-            });
-        }
-
-        const { jsonResponsePromise, captureHtmlPromise, cfDetected } = attachResponseListeners(
+        const { jsonResponsePromise, captureHtmlPromise } = attachResponseListeners(
             page, reqId, startTime, targetUrl, proxyOpts, loggers
         );
 
@@ -421,9 +384,6 @@ export async function scrapeWithBrowser(
             rawHtml = await renderPage(page, reqId, startTime, proxyOpts, loggers);
         } else {
             rawHtml = await interceptPage(page, reqId, startTime, proxyOpts, captureHtmlPromise, loggers);
-            if (cfDetected.value) {
-                loggers.info(`[#${reqId} +${ms(startTime)}ms] ✓ Cloudflare challenge bypassed`);
-            }
         }
 
         // Capture screenshot before closing the page (if requested)
@@ -431,7 +391,7 @@ export async function scrapeWithBrowser(
             screenshotPath = await captureScreenshotAsync(page, targetUrl, reqId, startTime, loggers);
         }
 
-        return { isJson: false, status: 200, body: rawHtml, headers: { 'content-type': 'text/html; charset=utf-8' }, screenshotPath, cloudflareDetected: cfDetected.value };
+        return { isJson: false, status: 200, body: rawHtml, headers: { 'content-type': 'text/html; charset=utf-8' }, screenshotPath };
     } finally {
         if (page) await page.close().catch(() => logCleanupError(warnCleanup));
         if (context) await context.close().catch(() => logCleanupError(warnCleanup));
