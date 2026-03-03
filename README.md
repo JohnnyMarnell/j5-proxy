@@ -4,7 +4,11 @@
 [![npm](https://img.shields.io/npm/v/j5-proxy)](https://www.npmjs.com/package/j5-proxy)
 [![license](https://img.shields.io/github/license/JohnnyMarnell/proxy)](LICENSE)
 
-Headless Chrome proxy that lets you fetch any URL through a stealth-configured Playwright browser. Supports HTML scraping, full JS rendering, and JSON API proxying — all controllable per-request via the `X-Proxy-Options` header. Also ships a programmatic API for use as a library.
+Proxy utility that can seamlessly pass Cloudfare bot detection and automatically inject cookies.
+
+Supports HTML scraping, full JS rendering, and JSON API proxying — all controllable per-request via the `X-Proxy-Options` header. Ships as both CLI and programmatic API for use as a library.
+
+Also works as a local [Zyte](https://www.zyte.com/) emulator.
 
 ## Install
 
@@ -60,15 +64,15 @@ j5-proxy
 | `-p`, `--port` | `8787` | Server port |
 | `-t`, `--ttl` | `3600000` | Cookie cache TTL (ms) |
 | `--log-html` | `false` | Log HTML at each pipeline step to stdout (all requests) |
-| `--log-file` | `/tmp/proxy.jsonl` | Path for the JSONL request log |
+| `--log-file` | `/tmp/j5-proxy.jsonl` | Path for the JSONL request log |
 | `-i`, `--idle` | `1800000` | Auto-shutdown after ms of inactivity (default 30m) |
 | `--throttle-interval` | `5000` | Cache responses for this many ms |
 | `--throttle-regex` | `.*` | Only cache URLs matching this regex |
 
 ```bash
-bun --hot index.ts -p 3000 --log-html --log-file ./requests.jsonl
-bun --hot index.ts --throttle-interval 10000 --throttle-regex 'example\.com'
-bun --hot index.ts --help
+bun --hot index -p 3000 --log-html --log-file ./requests.jsonl
+bun --hot index --throttle-interval 10000 --throttle-regex 'example\.com'
+bun --hot index --help
 ```
 
 ## Usage
@@ -156,7 +160,7 @@ When enabled, stdout shows a 500-char preview at each step:
 
 ### JSONL request log
 
-Every request is logged to `/tmp/proxy.jsonl` (configurable via `--log-file`). Each line is a JSON object you can tail and pipe through `jq`.
+Every request is logged to `/tmp/j5-proxy.jsonl` (configurable via `--log-file`). Each line is a JSON object you can tail and pipe through `jq`.
 
 **Log entries are emitted at each step**, not just at the end — so `tail -f` shows activity immediately:
 
@@ -196,13 +200,13 @@ Each entry includes:
 
 ```bash
 # Watch requests in real time
-tail -f /tmp/proxy.jsonl | jq '{id:.reqId, step:.step, ms:.elapsed}'
+tail -f /tmp/j5-proxy.jsonl | jq '{id:.reqId, step:.step, ms:.elapsed}'
 
 # See just completed requests with timing
-tail -f /tmp/proxy.jsonl | jq 'select(.duration) | {id:.reqId, url:.url, ms:.duration, status:.status}'
+tail -f /tmp/j5-proxy.jsonl | jq 'select(.duration) | {id:.reqId, url:.url, ms:.duration, status:.status}'
 
 # Filter JSON API responses
-tail -f /tmp/proxy.jsonl | jq 'select(.step=="json-response") | {url:.request.url, ms:.elapsed, len:.response.bodyLength}'
+tail -f /tmp/j5-proxy.jsonl | jq 'select(.step=="json-response") | {url:.request.url, ms:.elapsed, len:.response.bodyLength}'
 ```
 
 ### Non-2XX response logging

@@ -1,7 +1,7 @@
 {
   "name": "j5-proxy",
   "version": "1.0.0",
-  "description": "Headless Chrome proxy with Playwright stealth — scrape any URL through a real browser, with render mode, JSON passthrough, response caching, and a programmatic API",
+  "description": "Proxy utility that can seamlessly pass Cloudfare bot detection and automatically inject cookies",
   "module": "index.ts",
   "main": "dist/api.js",
   "type": "module",
