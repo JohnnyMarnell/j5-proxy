@@ -12,7 +12,7 @@ declare -a URLS=(
     "https://bot.sannysoft.com/"
     "https://abrahamjuliot.github.io/creepjs/"
     "https://www.browserscan.net/bot-detection"
-    "https://pixelscan.net/"
+    "https://pixelscan.net/fingerprint-check"
     "https://browserleaks.com/"
 )
 

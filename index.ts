@@ -242,7 +242,7 @@ function tryCache(ctx: RequestContext): Response | null {
     return new Response(cached.body, { status: cached.status, headers: stripHopByHop(cached.headers) });
 }
 
-function logCompletion(ctx: RequestContext, responseStatus: number, responseBody: string, fromCache: boolean, responseError?: string, screenshotPath?: string) {
+function logCompletion(ctx: RequestContext, responseStatus: number, responseBody: string, fromCache: boolean, responseError?: string, screenshotPath?: string, cloudflareDetected?: boolean) {
     const duration = elapsed(ctx);
 
     if (!fromCache && !ctx.proxyOpts.render && !ctx.proxyOpts.selector && responseStatus === 200 && THROTTLE_REGEX.test(ctx.targetUrl)) {
@@ -255,13 +255,14 @@ function logCompletion(ctx: RequestContext, responseStatus: number, responseBody
         (!ctx.proxyOpts.render && !ctx.proxyOpts.selector && THROTTLE_REGEX.test(ctx.targetUrl) && responseStatus === 200) ? ' [cache-stored]' : '';
     const proxyOptsStr = ctx.tags.length ? ` [${ctx.tags.join(', ')}]` : '';
     const errorStr = responseError ? ` ERR: ${responseError}` : '';
+    const cloudflareStr = cloudflareDetected ? ' ✓cf-bypass' : '';
     const screenshotStr = screenshotPath ? ` 📸 ${screenshotPath}` : '';
     const truncUrl = ctx.targetUrl.substring(0, 70) + (ctx.targetUrl.length > 70 ? '...' : '');
     const bodySummary = (responseStatus < 200 || responseStatus >= 300) ? ` body=${summarizeBody(responseBody)}` : '';
 
     const isSuccess = responseStatus >= 200 && responseStatus < 300;
     const logFn = isSuccess ? consola.success : consola.warn;
-    logFn(`[#${ctx.reqId}] GET ${truncUrl} → ${responseStatus} (${responseBody.length}B) ${duration}ms${cacheStatus}${proxyOptsStr}${errorStr}${bodySummary}${screenshotStr}`);
+    logFn(`[#${ctx.reqId}] GET ${truncUrl} → ${responseStatus} (${responseBody.length}B) ${duration}ms${cacheStatus}${proxyOptsStr}${cloudflareStr}${errorStr}${bodySummary}${screenshotStr}`);
     if (!isSuccess) notifyError(ctx.reqId, responseStatus, ctx.targetUrl);
 
     logToFile({
@@ -358,6 +359,7 @@ app.get('/*', async (c) => {
     let responseBody = '';
     let responseError: string | undefined;
     let screenshotPath: string | undefined;
+    let cloudflareDetected = false;
 
     try {
         const cookies = cookiesAvailable ? getCookies(ctx.proxyOpts.refreshCookies, COOKIE_CACHE_TTL) : [];
@@ -391,6 +393,7 @@ app.get('/*', async (c) => {
         );
 
         responseStatus = output.status;
+        cloudflareDetected = output.cloudflareDetected ?? false;
 
         if (output.isJson) {
             responseBody = output.body;
@@ -409,7 +412,7 @@ app.get('/*', async (c) => {
         responseBody = `Error scraping page: ${error.message}`;
         return new Response(responseBody, { status: 500 });
     } finally {
-        logCompletion(ctx, responseStatus, responseBody, false, responseError, screenshotPath);
+        logCompletion(ctx, responseStatus, responseBody, false, responseError, screenshotPath, cloudflareDetected);
     }
 });
 

@@ -80,7 +80,7 @@ Sites tested:
 - https://bot.sannysoft.com/
 - https://abrahamjuliot.github.io/creepjs/
 - https://www.browserscan.net/bot-detection
-- https://pixelscan.net/
+- https://pixelscan.net/fingerprint-check
 - https://browserleaks.com/
 
 Screenshots are saved to `/tmp/j5-proxy_*.png` for inspection.
@@ -190,17 +190,17 @@ curl -H "X-Proxy-Options: render, screenshot" http://localhost:8787/example.com
 - https://bot.sannysoft.com/
 - https://abrahamjuliot.github.io/creepjs/
 - https://www.browserscan.net/bot-detection
-- https://pixelscan.net/
+- https://pixelscan.net/fingerprint-check
 - https://browserleaks.com/
 
 Example workflow:
 ```bash
 # Take screenshots before and after render mode
 curl -H "X-Proxy-Options: screenshot" http://localhost:8787/bot.sannysoft.com
-curl -H "X-Proxy-Options: render, screenshot" http://localhost:8787/bot.sannysoft.com
+curl -H "X-Proxy-Options: render, screenshot" http://localhost:8787/pixelscan.net/fingerprint-check
 
 # Check the logs
-tail -f /tmp/j5-proxy.jsonl | jq 'select(.screenshotPath) | {url: .url, screenshot: .screenshotPath}'
+tail -f /tmp/j5-proxy.jsonl | jq 'select(.step=="screenshot") | {url: .request.url, screenshot: .response.screenshotPath}'
 ```
 
 ### JSON API proxying

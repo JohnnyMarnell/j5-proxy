@@ -155,18 +155,16 @@ export interface ScrapeOutput {
     body: string;
     headers: Record<string, string>;
     screenshotPath?: string;
+    cloudflareDetected?: boolean;
 }
 
-// Cloudflare challenge detection patterns
+// Cloudflare challenge detection patterns (relaxed to avoid false positives)
 function isCloudflareChallenge(html: string): boolean {
     return !!(
         html.includes('challenge-error-text') ||
         html.includes('Just a moment') ||
-        html.includes('cf_clearance') ||  // CF challenge cookie indicator
-        html.includes('__cf_bm') ||        // CF bot management cookie
         html.includes('Checking your browser') ||
-        html.includes('Enable JavaScript and cookies') ||
-        (html.includes('Cloudflare') && html.includes('Ray ID'))
+        (html.includes('Enable JavaScript') && html.includes('cookies'))
     );
 }
 
@@ -406,7 +404,7 @@ export async function scrapeWithBrowser(
             screenshotPath = await captureScreenshotAsync(page, targetUrl, reqId, startTime, loggers);
         }
 
-        return { isJson: false, status: 200, body: rawHtml, headers: { 'content-type': 'text/html; charset=utf-8' }, screenshotPath };
+        return { isJson: false, status: 200, body: rawHtml, headers: { 'content-type': 'text/html; charset=utf-8' }, screenshotPath, cloudflareDetected };
     } finally {
         if (page) await page.close().catch(() => logCleanupError(warnCleanup));
         if (context) await context.close().catch(() => logCleanupError(warnCleanup));
