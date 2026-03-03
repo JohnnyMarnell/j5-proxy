@@ -29,7 +29,7 @@ npm install j5-proxy
 ```
 
 Chromium is downloaded automatically on first install via the `postinstall` script.
-If you skipped that step: `npx playwright install chromium`
+If you skipped that step: `npx patchright install chromium`
 
 ### Standalone binary
 

@@ -1,6 +1,5 @@
 /// <reference lib="dom" />
-import { chromium } from 'playwright-extra';
-import stealth from 'puppeteer-extra-plugin-stealth';
+import { chromium } from 'patchright';
 import { execSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -8,8 +7,6 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { ProxyOptions } from './lib';
 
-// Apply stealth plugin once — chromium is a module-level singleton shared across all imports
-chromium.use(stealth());
 
 export const STEALTH_UA =
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
