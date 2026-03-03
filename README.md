@@ -1,17 +1,56 @@
-# proxy
+# j5-proxy
 
-Headless Chrome proxy that lets you fetch any URL through a stealth-configured Playwright browser. Supports HTML scraping, full JS rendering, and JSON API proxying — all controllable per-request via the `X-Proxy-Options` header.
+[![CI](https://github.com/JohnnyMarnell/proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/JohnnyMarnell/proxy/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/j5-proxy)](https://www.npmjs.com/package/j5-proxy)
+[![license](https://img.shields.io/github/license/JohnnyMarnell/proxy)](LICENSE)
+
+Headless Chrome proxy that lets you fetch any URL through a stealth-configured Playwright browser. Supports HTML scraping, full JS rendering, and JSON API proxying — all controllable per-request via the `X-Proxy-Options` header. Also ships a programmatic API for use as a library.
 
 ## Install
 
 ```bash
-bun install
+# Bun (recommended)
+bunx j5-proxy
+
+# npm / npx
+npx j5-proxy
+
+# Global install
+npm install -g j5-proxy
+bun add -g j5-proxy
+
+# As a library (programmatic API)
+bun add j5-proxy
+npm install j5-proxy
+```
+
+Chromium is downloaded automatically on first install via the `postinstall` script.
+If you skipped that step, run: `npx playwright install chromium`
+
+### Standalone binary (no runtime required)
+
+Download a pre-built binary from [GitHub Releases](https://github.com/JohnnyMarnell/proxy/releases):
+
+```bash
+# macOS (Apple Silicon)
+curl -L https://github.com/JohnnyMarnell/proxy/releases/latest/download/j5-proxy-mac-arm64 -o j5-proxy
+chmod +x j5-proxy && ./j5-proxy
+```
+
+### Development
+
+```bash
+git clone https://github.com/JohnnyMarnell/proxy
+cd proxy && bun install
+bun --hot index.ts
 ```
 
 ## Run
 
 ```bash
 bun --hot index.ts
+# or after global install:
+j5-proxy
 ```
 
 ### CLI flags
@@ -194,6 +233,49 @@ Cookies are automatically extracted from your local Chrome via `cookies.py` and 
 ### Idle auto-shutdown
 
 The proxy automatically shuts down after `--idle` ms (default 30 minutes) of inactivity. A macOS notification is sent on shutdown.
+
+## Programmatic API
+
+Use j5-proxy as a library — no HTTP server needed.
+
+```typescript
+import { scrape, createProxy } from 'j5-proxy';
+
+// One-shot scrape (creates + closes a browser per call)
+const { html, status, isJson } = await scrape('https://example.com', {
+  render: true,       // full JS render mode
+  wait: 10000,        // max wait for networkidle (ms)
+  selector: '#main',  // wait for a CSS selector to appear
+  settle: 500,        // extra settle time after networkidle (ms)
+});
+
+// Long-lived proxy server (keeps one browser alive)
+const proxy = await createProxy({
+  port: 8787,
+  throttleInterval: 10_000,
+  throttleRegex: 'example\\.com',
+});
+// proxy is now reachable at http://localhost:8787
+await proxy.stop(); // closes browser + server
+```
+
+### Cookie extraction
+
+Cookies from your local Chrome are automatically injected if `browser_cookie3` is installed:
+
+```bash
+pip install browser-cookie3
+```
+
+Without it, the proxy works fine but without session cookies. To force a refresh:
+
+```bash
+# CLI
+j5-proxy --refresh-cookies
+
+# Per-request header (errors with 503 if cookies are unavailable)
+curl -H "X-Proxy-Options: refresh-cookies" http://localhost:8787/example.com
+```
 
 ## X-Proxy-Options reference
 

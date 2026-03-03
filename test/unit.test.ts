@@ -78,6 +78,7 @@ describe('parseProxyOptions', () => {
             wait: 20000,
             selector: null,
             settle: 1000,
+            refreshCookies: false,
         });
     });
 
@@ -109,10 +110,16 @@ describe('parseProxyOptions', () => {
         expect(opts.selector).toBe('[data-id=foo]');
     });
 
+    test('parses refresh-cookies flag', () => {
+        const opts = parseProxyOptions('refresh-cookies');
+        expect(opts.refreshCookies).toBe(true);
+    });
+
     test('is case-insensitive for flags', () => {
-        const opts = parseProxyOptions('Render, Log-Html');
+        const opts = parseProxyOptions('Render, Log-Html, Refresh-Cookies');
         expect(opts.render).toBe(true);
         expect(opts.logHtml).toBe(true);
+        expect(opts.refreshCookies).toBe(true);
     });
 
     test('invalid wait falls back to default', () => {
@@ -191,7 +198,7 @@ describe('stripHopByHop', () => {
 
     test('handles empty headers', () => {
         const headers = stripHopByHop({});
-        expect([...headers.entries()]).toHaveLength(0);
+        expect([...(headers as any).entries()]).toHaveLength(0);
     });
 });
 

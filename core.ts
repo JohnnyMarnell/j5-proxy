@@ -1,0 +1,343 @@
+/// <reference lib="dom" />
+import { chromium } from 'playwright-extra';
+import stealth from 'puppeteer-extra-plugin-stealth';
+import { execSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import type { ProxyOptions } from './lib';
+
+// Apply stealth plugin once — chromium is a module-level singleton shared across all imports
+chromium.use(stealth());
+
+export const STEALTH_UA =
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+// --- BROWSER ---
+
+export async function launchBrowser(): Promise<any> {
+    return chromium.launch({ headless: true });
+}
+
+// --- CLEANUP ERROR DEBOUNCE ---
+
+let _cleanupErrCount = 0;
+let _cleanupErrTimer: ReturnType<typeof setTimeout> | null = null;
+
+export function logCleanupError(warn: (msg: string) => void = () => {}) {
+    _cleanupErrCount++;
+    if (!_cleanupErrTimer) {
+        _cleanupErrTimer = setTimeout(() => {
+            warn(`${_cleanupErrCount} stale CDP session error${_cleanupErrCount > 1 ? 's' : ''} suppressed during cleanup.`);
+            _cleanupErrCount = 0;
+            _cleanupErrTimer = null;
+        }, 2000);
+    }
+}
+
+// --- COOKIE MANAGEMENT ---
+
+/** Finds cookies.py by checking several candidate locations. */
+function findCookieScript(): string | null {
+    try {
+        // Bun provides import.meta.dir; Node ESM needs fileURLToPath
+        const dir: string = typeof (import.meta as any).dir === 'string'
+            ? (import.meta as any).dir
+            : dirname(fileURLToPath(import.meta.url));
+
+        const candidates = [
+            process.env['J5_COOKIE_SCRIPT'],  // explicit override always wins
+            join(dir, 'cookies.py'),           // dev: core.ts lives in project root
+            join(dir, '..', 'cookies.py'),     // compiled: dist/core.js → one level up
+        ].filter(Boolean) as string[];
+
+        return candidates.find(p => existsSync(p)) ?? null;
+    } catch {
+        return null;
+    }
+}
+
+export let cookiesAvailable = false;
+let _pythonCmd: string | null = null;
+let _cookieScriptPath: string | null = null;
+let _cachedCookies: any[] = [];
+let _lastCookieFetch = 0;
+
+export interface CookiePrereqResult {
+    available: boolean;
+    reason?: string;
+}
+
+/**
+ * Probes for Python + browser_cookie3 + cookies.py.
+ * Sets the module-level `cookiesAvailable` flag.
+ * Safe to call multiple times — re-probes each time.
+ */
+export function checkCookiePrereqs(): CookiePrereqResult {
+    _cookieScriptPath = findCookieScript();
+
+    _pythonCmd = null;
+    for (const cmd of ['python3', 'python']) {
+        try {
+            execSync(`${cmd} -c "import browser_cookie3"`, { stdio: 'pipe' });
+            _pythonCmd = cmd;
+            break;
+        } catch {}
+    }
+
+    const reasons = [
+        !_pythonCmd     ? 'browser_cookie3 not found (pip install browser-cookie3)' : null,
+        !_cookieScriptPath ? 'cookies.py not found (expected alongside the binary, or set J5_COOKIE_SCRIPT)' : null,
+    ].filter(Boolean).join('; ');
+
+    cookiesAvailable = !!_pythonCmd && !!_cookieScriptPath;
+    return cookiesAvailable ? { available: true } : { available: false, reason: reasons };
+}
+
+/**
+ * Returns cookies from cache, or runs cookies.py to get fresh ones.
+ *
+ * - Normal mode (`forceRefresh=false`): returns [] silently if unavailable.
+ * - Refresh mode (`forceRefresh=true`): throws if unavailable.
+ */
+export function getCookies(forceRefresh = false, ttl = 3_600_000): any[] {
+    if (forceRefresh && !cookiesAvailable) {
+        throw new Error(
+            'Cookie refresh requested but extraction is unavailable. ' +
+            'Install browser-cookie3 and ensure cookies.py exists alongside the binary, ' +
+            'or point J5_COOKIE_SCRIPT to its path.'
+        );
+    }
+
+    if (!cookiesAvailable) return [];
+
+    const now = Date.now();
+    if (!forceRefresh && _cachedCookies.length > 0 && now - _lastCookieFetch < ttl) {
+        return _cachedCookies;
+    }
+
+    try {
+        const out = execSync(`${_pythonCmd!} ${_cookieScriptPath!}`).toString();
+        const parsed = JSON.parse(out);
+        if (parsed.error) throw new Error(parsed.error);
+        _cachedCookies = parsed;
+        _lastCookieFetch = now;
+        return _cachedCookies;
+    } catch (err: any) {
+        if (forceRefresh) throw err;
+        return _cachedCookies; // return stale on silent failure
+    }
+}
+
+// --- SCRAPING PIPELINE ---
+
+export interface ScrapeLoggers {
+    info(msg: string): void;
+    warn(msg: string): void;
+    /** Called on the first document response from the browser. */
+    onFirstResponse?(status: number, bytes: number, ms: number): void;
+    /** Called when an application/json response is detected. */
+    onJsonResponse?(status: number, bytes: number, ms: number, headers: Record<string, string>, body: string): void;
+    /** Called at each HTML pipeline step when logHtml is enabled. */
+    onHtmlStep?(label: string, html: string, ms: number): void;
+    onSelectorFound?(selector: string): void;
+    onSelectorTimeout?(selector: string, timeoutMs: number): void;
+    onNetworkIdleTimeout?(): void;
+}
+
+const SILENT: ScrapeLoggers = { info: () => {}, warn: () => {} };
+
+export interface ScrapeOutput {
+    isJson: boolean;
+    status: number;
+    body: string;
+    headers: Record<string, string>;
+}
+
+function ms(startTime: number) { return Date.now() - startTime; }
+
+export function attachResponseListeners(
+    page: any,
+    reqId: number,
+    startTime: number,
+    targetUrl: string,
+    proxyOpts: ProxyOptions,
+    loggers: ScrapeLoggers = SILENT,
+): { jsonResponsePromise: Promise<{ body: string; headers: Record<string, string>; status: number }>; captureHtmlPromise: Promise<string> } {
+    let firstResponseLogged = false;
+    let resolveJson!: (r: { body: string; headers: Record<string, string>; status: number }) => void;
+    const jsonResponsePromise = new Promise<{ body: string; headers: Record<string, string>; status: number }>((r) => { resolveJson = r; });
+    let resolveCapture!: (html: string) => void;
+    const captureHtmlPromise = new Promise<string>((r) => { resolveCapture = r; });
+
+    page.on('response', async (response: any) => {
+        if (response.request().frame() !== page.mainFrame()) return;
+
+        const contentType = response.headers()['content-type'] || '';
+        const isJson = contentType.includes('application/json');
+        const isDocument = response.request().resourceType() === 'document';
+
+        if (!isDocument && !isJson) return;
+
+        try {
+            const text = await response.text();
+
+            if (isJson) {
+                const elapsed = ms(startTime);
+                loggers.info(`[#${reqId} +${elapsed}ms] JSON response: ${response.status()} (${text.length} bytes)`);
+                const upstreamHeaders: Record<string, string> = {};
+                for (const [k, v] of Object.entries(response.headers())) {
+                    upstreamHeaders[k] = v as string;
+                }
+                loggers.onJsonResponse?.(response.status(), text.length, elapsed, upstreamHeaders, text);
+                resolveJson({ body: text, headers: upstreamHeaders, status: response.status() });
+                return;
+            }
+
+            if (isDocument && !firstResponseLogged) {
+                firstResponseLogged = true;
+                const elapsed = ms(startTime);
+                loggers.info(`[#${reqId} +${elapsed}ms] First response: ${response.status()} (${text.length} bytes)`);
+                loggers.onFirstResponse?.(response.status(), text.length, elapsed);
+            }
+
+            if (isDocument && !proxyOpts.render) {
+                if (!text.includes('challenge-error-text') && !text.includes('Just a moment')) {
+                    if (text.length > 1000) {
+                        if (proxyOpts.logHtml) {
+                            loggers.onHtmlStep?.('intercepted-response', text, ms(startTime));
+                        }
+                        resolveCapture(text);
+                    }
+                } else {
+                    loggers.info(`[#${reqId} +${ms(startTime)}ms] Cloudflare challenge detected, waiting...`);
+                }
+            }
+        } catch {
+            // Body might be unavailable during rapid redirects
+        }
+    });
+
+    return { jsonResponsePromise, captureHtmlPromise };
+}
+
+export async function renderPage(
+    page: any,
+    reqId: number,
+    startTime: number,
+    proxyOpts: ProxyOptions,
+    loggers: ScrapeLoggers = SILENT,
+): Promise<string> {
+    if (proxyOpts.logHtml) {
+        loggers.onHtmlStep?.('after-commit', await page.content(), ms(startTime));
+    }
+
+    await page.waitForLoadState('networkidle', { timeout: proxyOpts.wait }).catch(() => {
+        loggers.warn(`[#${reqId} +${ms(startTime)}ms] networkidle timed out, continuing with current DOM`);
+        loggers.onNetworkIdleTimeout?.();
+    });
+
+    if (proxyOpts.logHtml) {
+        loggers.onHtmlStep?.('after-networkidle', await page.content(), ms(startTime));
+    }
+
+    if (proxyOpts.selector) {
+        try {
+            await page.waitForSelector(proxyOpts.selector, { timeout: proxyOpts.wait });
+            loggers.info(`[#${reqId} +${ms(startTime)}ms] Selector "${proxyOpts.selector}" appeared`);
+            loggers.onSelectorFound?.(proxyOpts.selector);
+        } catch {
+            loggers.warn(`[#${reqId} +${ms(startTime)}ms] Selector "${proxyOpts.selector}" not found within ${proxyOpts.wait}ms`);
+            loggers.onSelectorTimeout?.(proxyOpts.selector, proxyOpts.wait);
+        }
+        if (proxyOpts.logHtml) {
+            loggers.onHtmlStep?.('after-selector', await page.content(), ms(startTime));
+        }
+    }
+
+    await page.waitForTimeout(proxyOpts.settle);
+    const rawHtml = await page.content();
+    if (proxyOpts.logHtml) {
+        loggers.onHtmlStep?.('final-rendered', rawHtml, ms(startTime));
+    }
+    return rawHtml;
+}
+
+export async function interceptPage(
+    page: any,
+    reqId: number,
+    startTime: number,
+    proxyOpts: ProxyOptions,
+    captureHtmlPromise: Promise<string>,
+    loggers: ScrapeLoggers = SILENT,
+): Promise<string> {
+    try {
+        return await Promise.race([
+            captureHtmlPromise,
+            new Promise<string>((_, reject) =>
+                setTimeout(() => reject(new Error('Timeout waiting for real HTML (Cloudflare might be stuck)')), 25000)
+            ),
+        ]);
+    } catch {
+        loggers.warn(`[#${reqId} +${ms(startTime)}ms] Intercept timed out, falling back to live DOM.`);
+        const rawHtml = await page.content();
+        if (proxyOpts.logHtml) {
+            loggers.onHtmlStep?.('fallback-dom', rawHtml, ms(startTime));
+        }
+        return rawHtml;
+    }
+}
+
+/**
+ * Core scraping function. Opens a browser context, navigates to the URL,
+ * and returns the final HTML or JSON body.
+ *
+ * Handles JSON early-exit, Cloudflare detection, render mode, and selector waiting.
+ * Logging is fully optional via the `loggers` parameter.
+ */
+export async function scrapeWithBrowser(
+    browser: any,
+    reqId: number,
+    startTime: number,
+    targetUrl: string,
+    proxyOpts: ProxyOptions,
+    cookies: any[] = [],
+    loggers: ScrapeLoggers = SILENT,
+    warnCleanup: (msg: string) => void = () => {},
+): Promise<ScrapeOutput> {
+    let context: any;
+    let page: any;
+    try {
+        context = await browser.newContext({
+            userAgent: STEALTH_UA,
+            viewport: { width: 1280, height: 720 },
+        });
+        if (cookies.length > 0) await context.addCookies(cookies);
+
+        page = await context.newPage();
+
+        const { jsonResponsePromise, captureHtmlPromise } = attachResponseListeners(
+            page, reqId, startTime, targetUrl, proxyOpts, loggers
+        );
+
+        await page.goto(targetUrl, { waitUntil: 'commit', timeout: 30000 });
+
+        // 500ms window to detect a JSON response before committing to the HTML pipeline
+        const jsonEarlyExit = await Promise.race([
+            jsonResponsePromise,
+            new Promise<null>((resolve) => setTimeout(() => resolve(null), 500)),
+        ]);
+        if (jsonEarlyExit) {
+            return { isJson: true, status: jsonEarlyExit.status, body: jsonEarlyExit.body, headers: jsonEarlyExit.headers };
+        }
+
+        const rawHtml = proxyOpts.render
+            ? await renderPage(page, reqId, startTime, proxyOpts, loggers)
+            : await interceptPage(page, reqId, startTime, proxyOpts, captureHtmlPromise, loggers);
+
+        return { isJson: false, status: 200, body: rawHtml, headers: { 'content-type': 'text/html; charset=utf-8' } };
+    } finally {
+        if (page) await page.close().catch(() => logCleanupError(warnCleanup));
+        if (context) await context.close().catch(() => logCleanupError(warnCleanup));
+    }
+}

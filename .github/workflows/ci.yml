@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_call: # allow release.yml to invoke this
+
+jobs:
+  typecheck:
+    name: Type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --ignore-scripts
+      - run: bun run typecheck
+
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --ignore-scripts
+      - run: bun test test/
+
+  e2e:
+    name: E2E tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # Skip postinstall (playwright install chromium) — we do it below with --with-deps
+      - run: bun install --ignore-scripts
+
+      # Cache the Playwright browser binary between runs
+      - name: Cache Playwright Chromium
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+
+      # Install Chromium + all Linux system deps (fonts, libs, etc.)
+      - name: Install Playwright Chromium
+        run: bunx playwright install --with-deps chromium
+
+      # Cookies are optional — proxy warns and continues without them.
+      # E2E tests don't assert on cookie behaviour so no pip install needed.
+      - name: Run E2E tests
+        run: bun test e2e/ --timeout 60000
