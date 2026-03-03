@@ -33,8 +33,12 @@ export function validateZyteAuth(authHeader: string | undefined): string | null 
 // --- X-Proxy-Options PARSING ---
 export interface ProxyOptions {
     render: boolean;
+    /** Let sub-requests run, wait for CF JSD oneshot verification and/or challenge bypass before returning. */
+    verify: boolean;
     logHtml: boolean;
     wait: number;
+    /** Render mode completion signal: 'domcontentloaded' | 'load' | 'networkidle'. Default: 'load'. */
+    loadState: 'domcontentloaded' | 'load' | 'networkidle';
     selector: string | null;
     settle: number;
     /** Force a fresh cookie extraction for this request. Errors loudly if cookies are unavailable. */
@@ -43,34 +47,74 @@ export interface ProxyOptions {
     screenshot: boolean;
 }
 
-export function parseProxyOptions(header: string | undefined, globalLogHtml = false): ProxyOptions {
+const VALID_BOOL_OPTIONS = new Set(['render', 'verify', 'log-html', 'refresh-cookies', 'screenshot']);
+const VALID_KV_OPTIONS = new Set(['wait', 'selector', 'settle', 'load-state']);
+const VALID_LOAD_STATES = new Set(['domcontentloaded', 'load', 'networkidle']);
+
+export function parseProxyOptions(header: string | undefined, globalLogHtml = false): { opts: ProxyOptions; errors: string[] } {
     const opts: ProxyOptions = {
         render: false,
+        verify: false,
         logHtml: globalLogHtml,
         wait: 20000,
+        loadState: 'load',
         selector: null,
         settle: 1000,
         refreshCookies: false,
         screenshot: false,
     };
-    if (!header) return opts;
-    const parts = header.split(',').map(s => s.trim());
+    const errors: string[] = [];
+    if (!header) return { opts, errors };
+
+    const parts = header.split(',').map(s => s.trim()).filter(Boolean);
     for (const part of parts) {
         const lower = part.toLowerCase();
-        if (lower === 'render') { opts.render = true; continue; }
-        if (lower === 'log-html') { opts.logHtml = true; continue; }
-        if (lower === 'refresh-cookies') { opts.refreshCookies = true; continue; }
-        if (lower === 'screenshot') { opts.screenshot = true; continue; }
-        const [key, ...rest] = part.split('=');
-        if (!key) continue;
-        const val = rest.join('=');
-        switch (key.trim().toLowerCase()) {
-            case 'wait': opts.wait = parseInt(val, 10) || 20000; break;
-            case 'selector': opts.selector = val.trim(); break;
-            case 'settle': opts.settle = parseInt(val, 10) || 1000; break;
+        if (lower === 'render')           { opts.render = true; continue; }
+        if (lower === 'verify')           { opts.verify = true; continue; }
+        if (lower === 'log-html')         { opts.logHtml = true; continue; }
+        if (lower === 'refresh-cookies')  { opts.refreshCookies = true; continue; }
+        if (lower === 'screenshot')       { opts.screenshot = true; continue; }
+
+        const eqIdx = part.indexOf('=');
+        if (eqIdx === -1) {
+            // No '=' — must be a boolean flag, but didn't match any known one
+            errors.push(`unknown option: "${part}" (valid: ${[...VALID_BOOL_OPTIONS].join(', ')})`);
+            continue;
+        }
+
+        const key = part.slice(0, eqIdx).trim().toLowerCase();
+        const val = part.slice(eqIdx + 1).trim();
+
+        if (!VALID_KV_OPTIONS.has(key)) {
+            errors.push(`unknown option: "${key}" (valid: ${[...VALID_KV_OPTIONS].join(', ')})`);
+            continue;
+        }
+
+        switch (key) {
+            case 'wait': {
+                const n = parseInt(val, 10);
+                if (isNaN(n) || n <= 0) errors.push(`invalid value for wait: "${val}" (expected positive integer ms)`);
+                else opts.wait = n;
+                break;
+            }
+            case 'settle': {
+                const n = parseInt(val, 10);
+                if (isNaN(n) || n < 0) errors.push(`invalid value for settle: "${val}" (expected non-negative integer ms)`);
+                else opts.settle = n;
+                break;
+            }
+            case 'selector':
+                opts.selector = val;
+                break;
+            case 'load-state': {
+                const ls = val.toLowerCase();
+                if (!VALID_LOAD_STATES.has(ls)) errors.push(`invalid load-state: "${val}" (valid: ${[...VALID_LOAD_STATES].join(', ')})`);
+                else opts.loadState = ls as ProxyOptions['loadState'];
+                break;
+            }
         }
     }
-    return opts;
+    return { opts, errors };
 }
 
 // --- CACHE KEY ---

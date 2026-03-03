@@ -4,9 +4,9 @@
 [![npm](https://img.shields.io/npm/v/j5-proxy)](https://www.npmjs.com/package/j5-proxy)
 [![license](https://img.shields.io/github/license/JohnnyMarnell/j5-proxy)](LICENSE)
 
-Proxy utility that can seamlessly pass Cloudfare bot detection and automatically inject cookies.
+Proxy utility that seamlessly passes Cloudflare bot detection and automatically injects local Chrome cookies.
 
-Supports HTML scraping, full JS rendering, and JSON API proxying — all controllable per-request via the `X-Proxy-Options` header. Ships as both CLI and programmatic API for use as a library.
+Supports fast HTML interception, full JS rendering, and JSON API proxying — all controllable per-request via the `X-Proxy-Options` header. Ships as both CLI and programmatic API.
 
 Also works as a local [Zyte](https://www.zyte.com/) emulator.
 
@@ -23,15 +23,15 @@ npx j5-proxy
 npm install -g j5-proxy
 bun add -g j5-proxy
 
-# As a library (programmatic API)
+# As a library
 bun add j5-proxy
 npm install j5-proxy
 ```
 
 Chromium is downloaded automatically on first install via the `postinstall` script.
-If you skipped that step, run: `npx playwright install chromium`
+If you skipped that step: `npx playwright install chromium`
 
-### Standalone binary (no runtime required)
+### Standalone binary
 
 Download a pre-built binary from [GitHub Releases](https://github.com/JohnnyMarnell/proxy/releases):
 
@@ -57,348 +57,296 @@ bun --hot index.ts
 j5-proxy
 ```
 
-### Bot detection testing
+## Usage
 
-Test the proxy against major bot detectors in parallel:
+Proxy any URL by passing it as the path:
 
 ```bash
-# Start the proxy in one terminal
-bun --hot index.ts
+curl http://localhost:8787/https://example.com
 
-# In another terminal, run the bot detector test suite
-bun run bot
-# or
-bash ./bin/bot-test.sh
+# https:// is assumed
+curl http://localhost:8787/example.com
 ```
 
-This will:
-1. Clear previous screenshots from `/tmp`
-2. Scrape all 5 bot detector sites **in parallel** with screenshots
-3. Automatically open all screenshots in your default image viewer
+---
+
+## Modes
+
+### Default — fast HTML interception
+
+Blocks all non-document sub-requests (scripts, fonts, images) before they hit the wire. Captures the first document response and closes the page immediately. Returns in roughly the time of one HTTP round-trip.
+
+A `<base>` tag is injected so relative URLs resolve against the original origin.
+
+```bash
+curl http://localhost:8787/example.com
+```
+
+### `render` — full JS execution
+
+Navigates the page and waits for the browser's `load` event (all initial resources fetched), then returns the live DOM. Use `load-state` to trade speed for thoroughness.
+
+```bash
+curl -H "X-Proxy-Options: render" http://localhost:8787/example.com
+```
+
+#### Load states
+
+| `load-state` | Completes when | Typical time | Use when |
+|---|---|---|---|
+| `domcontentloaded` | HTML parsed, deferred scripts run | ~100–500ms | Server-rendered pages, just need DOM structure |
+| `load` *(default)* | All initial resources fetched (scripts, CSS, images) | ~1–5s | Most JS-rendered pages |
+| `networkidle` | No network activity for 500ms | ~15–25s | SPAs with progressive async loading |
+
+```bash
+curl -H "X-Proxy-Options: render" http://localhost:8787/example.com
+# ^ load (default)
+
+curl -H "X-Proxy-Options: render, load-state=domcontentloaded" http://localhost:8787/example.com
+# ^ fastest
+
+curl -H "X-Proxy-Options: render, load-state=networkidle" http://localhost:8787/example.com
+# ^ most thorough, slowest
+```
+
+### `verify` — Cloudflare-aware interception
+
+Like default mode but allows all sub-requests to run so Cloudflare's background verification can complete. Holds the page open after HTML capture and waits for the CF JSD oneshot response (up to 5s) before returning. Good middle ground between default and full render.
+
+```bash
+curl -H "X-Proxy-Options: verify" http://localhost:8787/example.com
+```
+
+**What you'll see in logs:**
+```
+ℹ [#1 +312ms] ✓ CF JSD background verification request detected
+ℹ [#1 +489ms] ✓ verify: no CF challenge, real content received
+ℹ [#1 +891ms] ✓ CF JSD verification confirmed (200)
+ℹ [#1 +891ms] requests completed: document:1, script:4, fetch:2, stylesheet:1
+```
+
+If CF ever serves a blocking "Just a moment" challenge page (rare with a real Chrome fingerprint + cookies), `verify` holds and waits for the post-bypass document. Default mode would return the challenge HTML and warn.
+
+---
+
+## Cloudflare detection
+
+The proxy uses a real Chromium binary with the stealth plugin and injects your local Chrome cookies. This combination means CF typically sees a legitimate browser fingerprint and skips the interactive challenge entirely, going straight to background verification (CF JSD).
+
+**Two distinct CF signals — logged at all verbosity levels:**
+
+| Log | Meaning |
+|---|---|
+| `✓ CF JSD background verification request detected` | CF is doing invisible background browser verification. Real content was already served. Good. |
+| `✓ CF JSD verification confirmed (200)` | CF's oneshot POST completed — session verified. |
+| `⚠ CF challenge page detected — returning challenge HTML` | Blocking challenge was served. Use `verify` to wait it out. |
+| `✓ CF challenge page detected — waiting for bypass` | (`verify` mode) Holding for challenge to complete. |
+| `✓ CF bypass complete — real content received` | (`verify` mode) Challenge passed, real HTML captured. |
+
+---
+
+## CLI flags
+
+```bash
+bun --hot index.ts --help
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `-p`, `--port` | `8787` | Server port |
+| `-t`, `--ttl` | `3600000` | Cookie cache TTL (ms) |
+| `--log-html` | `false` | Log HTML at each pipeline step (truncated to 500 chars) |
+| `--log-file` | `/tmp/j5-proxy.jsonl` | Path for the JSONL request log |
+| `-i`, `--idle` | `1800000` | Auto-shutdown after ms of inactivity (0 to disable) |
+| `--throttle-interval` | `5000` | Cache responses for this many ms |
+| `--throttle-regex` | `.*` | Only cache URLs matching this regex |
+| `--notify` / `--no-notify` | `true` | OS notification on non-2XX responses |
+| `--startup-notify` / `--no-startup-notify` | `true` | OS notification on startup |
+| `--refresh-cookies` | `false` | Force fresh cookie extraction on startup |
+| `-v` / `-vv` / `-vvv` | off | Verbosity (see below) |
+
+### Verbosity levels
+
+```bash
+bun --hot index.ts -v      # log all requests, aborts, and responses
+bun --hot index.ts -vv     # same + HTML at pipeline steps (truncated to 500 chars)
+bun --hot index.ts -vvv    # same + full HTML body
+```
+
+| Level | Requests | Skipped (aborted) | Responses | HTML steps |
+|---|---|---|---|---|
+| *(none)* | — | count summary | — | — |
+| `-v` | documents only | count summary | ✓ | — |
+| `-vv` | documents only | each individually | ✓ | truncated |
+| `-vvv` | all (fire time + abort time) | each individually | ✓ | full |
+
+In default intercept mode, non-document requests are aborted before hitting the network. At `-v` you get a one-line summary at the end:
+```
+ℹ [#1 +843ms] ✗ skipped: script:6, font:2, image:4
+```
+At `-vv` each abort is logged as it fires:
+```
+ℹ [#1 +563ms] ✗ skip script https://...vendor.js
+```
+At `-vvv` you also see the initial request fire, then the abort:
+```
+ℹ [#1 +480ms] → script https://...vendor.js
+ℹ [#1 +481ms] ✗ skip script https://...vendor.js
+```
+
+---
+
+## X-Proxy-Options reference
+
+Pass as a comma-separated header. Unknown options or invalid values return **400**.
+
+```bash
+curl -H "X-Proxy-Options: render, wait=10000, selector=#content, settle=500" \
+  http://localhost:8787/example.com
+```
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `render` | flag | off | Full JS render mode |
+| `verify` | flag | off | CF-aware interception: allow sub-requests, wait for JSD oneshot |
+| `log-html` | flag | off | Log HTML at each pipeline step |
+| `screenshot` | flag | off | Save a headless screenshot to `/tmp` |
+| `refresh-cookies` | flag | off | Force fresh cookie extraction for this request |
+| `wait` | ms | `20000` | Max wait for load-state / selector in render mode |
+| `selector` | CSS | none | Wait for a CSS selector before capturing (render mode) |
+| `settle` | ms | `1000` | Extra wait after load-state/selector (render mode) |
+| `load-state` | string | `load` | Render completion signal: `domcontentloaded`, `load`, `networkidle` |
+
+**Invalid option → 400:**
+```bash
+curl -H "X-Proxy-Options: rendur" http://localhost:8787/example.com
+# HTTP 400
+# {"error":"Invalid X-Proxy-Options","details":["unknown option: \"rendur\" (valid: render, verify, log-html, refresh-cookies, screenshot)"]}
+```
+
+---
+
+## Logging
+
+### Console
+
+```
+✔ [#1] GET https://example.com → 200 (48231B) 843ms [cache-stored]
+✔ [#2] GET https://example.com → 200 (48231B) 2ms [cached #1]
+⚠ [#3] GET https://example.com/missing → 404 (153B) 210ms body={"error":"not found"}
+✔ [#4] GET https://example.com → 200 (48231B) 1203ms [render, log-html] 📸 /tmp/example-com_123.png
+```
+
+In render/verify mode, completed request counts are logged before the final line:
+```
+ℹ [#4 +1198ms] requests completed: document:1, script:8, fetch:3, stylesheet:2, image:1
+```
+
+### JSONL log
+
+Every request is appended to `--log-file` (default `/tmp/j5-proxy.jsonl`):
+
+```bash
+# Watch in real time
+tail -f /tmp/j5-proxy.jsonl | jq '{id:.reqId, ms:.duration, status:.status, url:.url}'
+
+# Only completed requests
+tail -f /tmp/j5-proxy.jsonl | jq 'select(.duration) | {id:.reqId, url:.url, ms:.duration, status:.status}'
+
+# JSON API responses
+tail -f /tmp/j5-proxy.jsonl | jq 'select(.step=="json-response") | {url:.request.url, ms:.elapsed}'
+
+# Screenshots
+tail -f /tmp/j5-proxy.jsonl | jq 'select(.step=="screenshot") | .response.screenshotPath'
+```
+
+Log steps emitted per request:
+
+| Step | When |
+|---|---|
+| `first-response` | First document response received by the browser |
+| `json-response` | JSON content-type detected — includes upstream headers |
+| `intercepted-response` | Default/verify mode captured HTML (with `log-html`) |
+| `after-commit` | DOM after initial commit (with `log-html` + `render`) |
+| `after-networkidle` | DOM after load-state completes (with `log-html` + `render`) |
+| `after-selector` | DOM after selector found (with `log-html` + `render` + `selector`) |
+| `final-rendered` | Final rendered DOM (with `log-html` + `render`) |
+| `fallback-dom` | Captured from live DOM after intercept timeout |
+| `screenshot` | Screenshot path recorded |
+
+---
+
+## Response throttle cache
+
+GET requests are cached for `--throttle-interval` ms (default 5s). Only URLs matching `--throttle-regex` are cached. `render` and `selector` requests bypass the cache.
+
+---
+
+## Cookie injection
+
+Cookies are automatically extracted from your local Chrome via `cookies.py` and injected into every browser context. Cached for `--ttl` ms (default 1 hour).
+
+Requires `browser_cookie3`:
+```bash
+pip install browser-cookie3
+```
+
+Without it the proxy works fine, just without session cookies. Force a refresh:
+```bash
+j5-proxy --refresh-cookies
+curl -H "X-Proxy-Options: refresh-cookies" http://localhost:8787/example.com
+```
+
+---
+
+## Idle auto-shutdown
+
+The proxy shuts down after `--idle` ms (default 30 minutes) of inactivity. Disable with `--idle 0`.
+
+---
+
+## Bot detection testing
+
+```bash
+bun --hot index.ts   # terminal 1
+bun run bot          # terminal 2 — scrapes 5 bot detector sites in parallel with screenshots
+```
 
 Sites tested:
 - https://bot.sannysoft.com/
 - https://abrahamjuliot.github.io/creepjs/
 - https://www.browserscan.net/bot-detection
 - https://pixelscan.net/fingerprint-check
-- https://browserleaks.com/
 
-Screenshots are saved to `/tmp/j5-proxy_*.png` for inspection.
+Screenshots saved to `/tmp/j5-proxy_*.png`.
 
-### CLI flags
-
-| Flag | Default | Description |
-|---|---|---|
-| `-p`, `--port` | `8787` | Server port |
-| `-t`, `--ttl` | `3600000` | Cookie cache TTL (ms) |
-| `--log-html` | `false` | Log HTML at each pipeline step to stdout (all requests) |
-| `--log-file` | `/tmp/j5-proxy.jsonl` | Path for the JSONL request log |
-| `-i`, `--idle` | `1800000` | Auto-shutdown after ms of inactivity (default 30m) |
-| `--throttle-interval` | `5000` | Cache responses for this many ms |
-| `--throttle-regex` | `.*` | Only cache URLs matching this regex |
-
-```bash
-bun --hot index -p 3000 --log-html --log-file ./requests.jsonl
-bun --hot index --throttle-interval 10000 --throttle-regex 'example\.com'
-bun --hot index --help
-```
-
-## Usage
-
-Proxy any URL by passing it as the path:
-
-```bash
-# Browser or curl — just append the target URL
-curl http://localhost:8787/https://example.com
-
-# https:// is assumed if no scheme given
-curl http://localhost:8787/example.com
-```
-
-## Features
-
-### Default mode — HTML interception
-
-Returns the first real HTML document response from the server, automatically detecting and waiting for Cloudflare challenge pages. A `<base>` tag is injected so relative URLs (CSS, JS, images) resolve against the original origin.
-
-**Cloudflare challenge detection** watches for:
-- `challenge-error-text` and `Just a moment` strings
-- Cloudflare challenge cookies (`cf_clearance`, `__cf_bm`)
-- `Checking your browser` and `Enable JavaScript and cookies` messages
-- `Cloudflare` + `Ray ID` combo (Cloudflare-specific headers)
-
-When a challenge is detected, the proxy logs:
-```
-ℹ [#1 +342ms] Cloudflare challenge detected, waiting for bypass...
-ℹ [#1 +2905ms] ✓ Cloudflare challenge bypassed
-```
-
-The browser automatically completes the challenge (typically 3-10 seconds), then the proxy captures and returns the real HTML.
-
-```bash
-curl http://localhost:8787/example.com
-# Automatically detects, waits for, and bypasses Cloudflare challenges
-```
-
-### Render mode — full JS execution
-
-Wait for the page to fully render (networkidle + JS settle time), then return the final DOM state. Useful for SPAs and pages that build their content client-side.
-
-```bash
-curl -H "X-Proxy-Options: render" http://localhost:8787/example.com
-```
-
-### Render sub-options
-
-Fine-tune render behavior per-request:
-
-| Option | Default | Description |
-|---|---|---|
-| `render` | off | Enable render mode |
-| `wait=<ms>` | `20000` | Max wait for networkidle and selector |
-| `selector=<css>` | none | Wait for a CSS selector to appear before capturing |
-| `settle=<ms>` | `1000` | Extra settle time after networkidle/selector for late JS mutations |
-
-```bash
-# Wait up to 10s, require #content to appear, 2s settle
-curl -H "X-Proxy-Options: render, wait=10000, selector=#content, settle=2000" \
-  http://localhost:8787/example.com
-```
-
-### Screenshot capture
-
-Take a headless browser screenshot for visual debugging or bot detector testing. The screenshot is captured **before** the response is sent, ensuring you can see exactly what the browser rendered at that moment.
-
-Screenshots are saved to `/tmp/<domain>_<timestamp>.png` and the path is included in both console and JSONL logs.
-
-```bash
-curl -H "X-Proxy-Options: screenshot" http://localhost:8787/example.com
-
-# Console output:
-✔ [#1] GET example.com → 200 (25688B) 775ms [screenshot] 📸 /tmp/example-com_1708452000123.png
-
-# JSONL log entry includes:
-# "screenshotPath": "/tmp/example-com_1708452000123.png"
-```
-
-**Combine with render mode for full JS execution + screenshot:**
-```bash
-curl -H "X-Proxy-Options: render, screenshot" http://localhost:8787/example.com
-```
-
-**Useful for testing against bot detectors:**
-- https://bot.sannysoft.com/
-- https://abrahamjuliot.github.io/creepjs/
-- https://www.browserscan.net/bot-detection
-- https://pixelscan.net/fingerprint-check
-- https://browserleaks.com/
-
-Example workflow:
-```bash
-# Take screenshots before and after render mode
-curl -H "X-Proxy-Options: screenshot" http://localhost:8787/bot.sannysoft.com
-curl -H "X-Proxy-Options: render, screenshot" http://localhost:8787/pixelscan.net/fingerprint-check
-
-# Check the logs
-tail -f /tmp/j5-proxy.jsonl | jq 'select(.step=="screenshot") | {url: .request.url, screenshot: .response.screenshotPath}'
-```
-
-### JSON API proxying
-
-If the target URL returns `application/json`, the proxy short-circuits immediately — no HTML pipeline, no rendering wait. The JSON body and upstream response headers are forwarded directly.
-
-```bash
-curl http://localhost:8787/api.example.com/v1/data
-# Returns JSON with original headers (content-type, cache-control, etc.)
-```
-
-### Response throttle cache
-
-GET requests are cached for `--throttle-interval` ms (default 5s) to avoid hammering the same URL. Only URLs matching `--throttle-regex` are cached. Render/selector requests bypass the cache.
-
-### HTML step logging
-
-Log the HTML at each stage of the pipeline to stdout. Enable per-request or globally:
-
-```bash
-# Per-request
-curl -H "X-Proxy-Options: log-html" http://localhost:8787/example.com
-
-# Per-request with render
-curl -H "X-Proxy-Options: render, log-html" http://localhost:8787/example.com
-
-# Globally via CLI
-bun --hot index.ts --log-html
-```
-
-When enabled, stdout shows a 500-char preview at each step:
-```
-[#1 +342ms HTML:after-commit] https://example.com
-────────────────────────────────────────────────────────────
-<!doctype html><html>... (48231 chars total)
-────────────────────────────────────────────────────────────
-```
-
-### JSONL request log
-
-Every request is logged to `/tmp/j5-proxy.jsonl` (configurable via `--log-file`). Each line is a JSON object you can tail and pipe through `jq`.
-
-**Log entries are emitted at each step**, not just at the end — so `tail -f` shows activity immediately:
-
-| Step | When |
-|---|---|
-| `first-response` | The very first document response the browser receives |
-| `json-response` | JSON detected — includes upstream headers |
-| `intercepted-response` | Default mode captured real HTML (with `log-html`) |
-| `after-commit` | DOM after initial commit (with `log-html` + `render`) |
-| `after-networkidle` | DOM after network settles (with `log-html` + `render`) |
-| `after-selector` | DOM after selector found (with `log-html` + `render` + `selector`) |
-| `final-rendered` | Final rendered DOM (with `log-html` + `render`) |
-| `fallback-dom` | Timeout fallback (with `log-html`) |
-| `screenshot` | Screenshot captured (with `screenshot` option) |
-
-Each entry includes:
-
-```json
-{
-  "ts": "2026-02-28T12:00:00.000Z",
-  "reqId": 1,
-  "elapsed": 342,
-  "step": "first-response",
-  "request": {
-    "url": "https://example.com",
-    "headers": { "host": "localhost:8787", "x-proxy-options": "render" },
-    "proxyOptions": { "render": true, "logHtml": false, "wait": 20000, "selector": null, "settle": 1000 }
-  },
-  "response": {
-    "status": 200,
-    "bodyLength": 48231,
-    "body": "<html>..."
-  }
-}
-```
-
-Screenshot step:
-```json
-{
-  "ts": "2026-02-28T12:05:10.123Z",
-  "reqId": 1,
-  "elapsed": 5210,
-  "step": "screenshot",
-  "request": {
-    "url": "https://bot.sannysoft.com",
-    "headers": { "host": "localhost:8787", "x-proxy-options": "screenshot" },
-    "proxyOptions": { "screenshot": true, ... }
-  },
-  "response": {
-    "screenshotPath": "/tmp/bot-sannysoft-com_1708452010123.png"
-  }
-}
-```
-
-**Tailing examples:**
-
-```bash
-# Watch requests in real time
-tail -f /tmp/j5-proxy.jsonl | jq '{id:.reqId, step:.step, ms:.elapsed}'
-
-# See just completed requests with timing
-tail -f /tmp/j5-proxy.jsonl | jq 'select(.duration) | {id:.reqId, url:.url, ms:.duration, status:.status}'
-
-# Filter JSON API responses
-tail -f /tmp/j5-proxy.jsonl | jq 'select(.step=="json-response") | {url:.request.url, ms:.elapsed, len:.response.bodyLength}'
-
-# Find screenshot steps
-tail -f /tmp/j5-proxy.jsonl | jq 'select(.step=="screenshot") | {id:.reqId, url:.request.url, screenshot:.response.screenshotPath}'
-```
-
-### Non-2XX response logging
-
-When the upstream returns a non-2XX status, the log line includes the response body (truncated, JSON compacted) for easier debugging:
-
-```
-✔ [#1] GET https://example.com → 200 (48231B) 342ms [cache-stored]
-⚠ [#2] GET https://example.com/missing → 404 (153B) 210ms body={"error":"not found"}
-```
-
-### Per-request timing
-
-All stdout and JSONL entries are tagged with `#reqId` and `+elapsedMs`, so concurrent requests stay distinguishable:
-
-```
-ℹ [#1 +342ms] First response: 200 (48231 bytes)
-ℹ [#1 +2905ms] Cloudflare challenge detected, waiting for bypass...
-ℹ [#1 +5210ms] ✓ Cloudflare challenge bypassed
-ℹ [#2 +180ms] JSON response: 200 (4523 bytes)
-✔ [#2] GET https://api.example.com/data → 200 (4523B) 195ms
-⚠ [#1 +2905ms] Selector "#content" not found within 20000ms
-✔ [#1] GET https://example.com → 200 (52001B) 4112ms [render, screenshot] 📸 /tmp/example-com_1708452000123.png
-```
-
-### Cookie injection
-
-Cookies are automatically extracted from your local Chrome via `cookies.py` and injected into every browser context. They're cached for the TTL duration (default 1 hour) to avoid repeated extraction.
-
-### Idle auto-shutdown
-
-The proxy automatically shuts down after `--idle` ms (default 30 minutes) of inactivity. A macOS notification is sent on shutdown.
+---
 
 ## Programmatic API
-
-Use j5-proxy as a library — no HTTP server needed.
 
 ```typescript
 import { scrape, createProxy } from 'j5-proxy';
 
-// One-shot scrape (creates + closes a browser per call)
 const { html, status, isJson } = await scrape('https://example.com', {
-  render: true,       // full JS render mode
-  wait: 10000,        // max wait for networkidle (ms)
-  selector: '#main',  // wait for a CSS selector to appear
-  settle: 500,        // extra settle time after networkidle (ms)
+  render: true,
+  wait: 10000,
+  selector: '#main',
+  settle: 500,
 });
 
-// Long-lived proxy server (keeps one browser alive)
-const proxy = await createProxy({
-  port: 8787,
-  throttleInterval: 10_000,
-  throttleRegex: 'example\\.com',
-});
-// proxy is now reachable at http://localhost:8787
-await proxy.stop(); // closes browser + server
+const proxy = await createProxy({ port: 8787 });
+await proxy.stop();
 ```
 
-### Cookie extraction
+---
 
-Cookies from your local Chrome are automatically injected if `browser_cookie3` is installed:
+## Zyte API emulation
+
+The proxy exposes a Zyte-compatible endpoint for drop-in local testing:
 
 ```bash
-pip install browser-cookie3
+curl -u "$(python3 -c 'import secrets; print(secrets.token_hex(16))')": \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://example.com", "httpResponseBody": true}' \
+  http://localhost:8787/v1/extract
 ```
-
-Without it, the proxy works fine but without session cookies. To force a refresh:
-
-```bash
-# CLI
-j5-proxy --refresh-cookies
-
-# Per-request header (errors with 503 if cookies are unavailable)
-curl -H "X-Proxy-Options: refresh-cookies" http://localhost:8787/example.com
-```
-
-## X-Proxy-Options reference
-
-Pass as a comma-separated header. All options are optional.
-
-```
-X-Proxy-Options: render, log-html, screenshot, wait=10000, selector=.main-content, settle=2000
-```
-
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `render` | flag | off | Full JS render mode |
-| `log-html` | flag | off | Log HTML at each step to stdout |
-| `screenshot` | flag | off | Take a headless browser screenshot (async, saves to /tmp) |
-| `wait` | ms | `20000` | Max wait for networkidle / selector |
-| `selector` | CSS | none | Wait for selector before capturing DOM |
-| `settle` | ms | `1000` | Post-render settle time |

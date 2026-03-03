@@ -3,6 +3,7 @@ import { chromium } from 'playwright-extra';
 import stealth from 'puppeteer-extra-plugin-stealth';
 import { execSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { ProxyOptions } from './lib';
@@ -160,6 +161,12 @@ export interface ScrapeOutput {
 }
 
 
+// Cloudflare blocking challenge — page is gating real content behind a JS challenge.
+// Only reliable indicators; CF JSD (invisible background verification) is NOT this.
+function isCloudflareChallenge(html: string): boolean {
+    return html.includes('challenge-error-text') || html.includes('Just a moment');
+}
+
 function ms(startTime: number) { return Date.now() - startTime; }
 
 // Sanitize a URL for use as a filename
@@ -185,7 +192,7 @@ export async function captureScreenshotAsync(
     try {
         const sanitized = sanitizeUrlForFilename(url);
         const timestamp = Date.now();
-        const filename = `/tmp/${sanitized}_${timestamp}.png`;
+        const filename = join(tmpdir(), `${sanitized}_${timestamp}.png`);
         await page.screenshot({ path: filename, fullPage: true });
         loggers.info(`[#${reqId}] Screenshot saved: ${filename}`);
         loggers.onScreenshot?.(filename, ms(startTime));
@@ -203,7 +210,7 @@ export function attachResponseListeners(
     targetUrl: string,
     proxyOpts: ProxyOptions,
     loggers: ScrapeLoggers = SILENT,
-): { jsonResponsePromise: Promise<{ body: string; headers: Record<string, string>; status: number }>; captureHtmlPromise: Promise<string>; skipCounts: Record<string, number> } {
+): { jsonResponsePromise: Promise<{ body: string; headers: Record<string, string>; status: number }>; captureHtmlPromise: Promise<string>; jsdVerifiedPromise: Promise<void>; skipCounts: Record<string, number>; completedCounts: Record<string, number> } {
     let firstResponseLogged = false;
     let resolveJson!: (r: { body: string; headers: Record<string, string>; status: number }) => void;
     const jsonResponsePromise = new Promise<{ body: string; headers: Record<string, string>; status: number }>((r) => { resolveJson = r; });
@@ -211,7 +218,34 @@ export function attachResponseListeners(
     let rejectCapture!: (err: Error) => void;
     const captureHtmlPromise = new Promise<string>((resolve, reject) => { resolveCapture = resolve; rejectCapture = reject; });
     const skipCounts: Record<string, number> = {};
+    const completedCounts: Record<string, number> = {};
     const verbosity = loggers.verbosity ?? 0;
+    let cfChallengeSeen = false;
+
+    page.on('requestfinished', (req: any) => {
+        const type = req.resourceType();
+        completedCounts[type] = (completedCounts[type] ?? 0) + 1;
+    });
+
+    // Always: detect CF JSD background verification (one-shot request) — fires on real pages after real content is served.
+    // Not a blocking challenge — CF is satisfied with the browser fingerprint and doing invisible background verification.
+    let cfJsdLogged = false;
+    page.on('request', (req: any) => {
+        if (!cfJsdLogged && req.url().includes('challenge-platform')) {
+            cfJsdLogged = true;
+            loggers.info(`[#${reqId} +${ms(startTime)}ms] ✓ CF JSD background verification request detected`);
+        }
+    });
+
+    // Always: watch for the JSD oneshot response — this is CF confirming the background verification passed.
+    let resolveJsd!: () => void;
+    const jsdVerifiedPromise = new Promise<void>((r) => { resolveJsd = r; });
+    page.on('response', (res: any) => {
+        if (res.url().includes('/jsd/oneshot')) {
+            loggers.info(`[#${reqId} +${ms(startTime)}ms] ✓ CF JSD verification confirmed (${res.status()})`);
+            resolveJsd();
+        }
+    });
 
     // -vvv: log every request as it fires (including those about to be skipped)
     if (verbosity >= 3) {
@@ -287,14 +321,33 @@ export function attachResponseListeners(
                 const elapsed = ms(startTime);
                 loggers.info(`[#${reqId} +${elapsed}ms] First response: ${response.status()} (${text.length} bytes)`);
                 loggers.onFirstResponse?.(response.status(), text.length, elapsed);
+                if (isCloudflareChallenge(text)) {
+                    cfChallengeSeen = true;
+                    if (proxyOpts.verify) {
+                        loggers.info(`[#${reqId} +${ms(startTime)}ms] ✓ CF challenge page detected — waiting for bypass`);
+                    } else {
+                        loggers.warn(`[#${reqId} +${ms(startTime)}ms] ⚠ CF challenge page detected — returning challenge HTML, use verify to bypass`);
+                    }
+                }
             }
 
             if (isDocument && !proxyOpts.render) {
                 if (text.length > 1000) {
-                    if (proxyOpts.logHtml) {
-                        loggers.onHtmlStep?.('intercepted-response', text, ms(startTime));
+                    if (proxyOpts.verify && isCloudflareChallenge(text)) {
+                        // Hold — wait for the real page after challenge completes
+                    } else {
+                        if (proxyOpts.verify) {
+                            if (cfChallengeSeen) {
+                                loggers.info(`[#${reqId} +${ms(startTime)}ms] ✓ CF bypass complete — real content received`);
+                            } else {
+                                loggers.info(`[#${reqId} +${ms(startTime)}ms] ✓ verify: no CF challenge, real content received`);
+                            }
+                        }
+                        if (proxyOpts.logHtml) {
+                            loggers.onHtmlStep?.('intercepted-response', text, ms(startTime));
+                        }
+                        resolveCapture(text);
                     }
-                    resolveCapture(text);
                 }
             }
         } catch {
@@ -302,7 +355,7 @@ export function attachResponseListeners(
         }
     });
 
-    return { jsonResponsePromise, captureHtmlPromise, skipCounts };
+    return { jsonResponsePromise, captureHtmlPromise, jsdVerifiedPromise, skipCounts, completedCounts };
 }
 
 export async function renderPage(
@@ -316,8 +369,8 @@ export async function renderPage(
         loggers.onHtmlStep?.('after-commit', await page.content(), ms(startTime));
     }
 
-    await page.waitForLoadState('networkidle', { timeout: proxyOpts.wait }).catch(() => {
-        loggers.warn(`[#${reqId} +${ms(startTime)}ms] networkidle timed out, continuing with current DOM`);
+    await page.waitForLoadState(proxyOpts.loadState, { timeout: proxyOpts.wait }).catch(() => {
+        loggers.warn(`[#${reqId} +${ms(startTime)}ms] ${proxyOpts.loadState} timed out, continuing with current DOM`);
         loggers.onNetworkIdleTimeout?.();
     });
 
@@ -372,6 +425,13 @@ export async function interceptPage(
     }
 }
 
+function logCompletedCounts(counts: Record<string, number>, reqId: number, startTime: number, loggers: ScrapeLoggers) {
+    const entries = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+    if (entries.length === 0) return;
+    const summary = entries.map(([t, n]) => `${t}:${n}`).join(', ');
+    loggers.info(`[#${reqId} +${ms(startTime)}ms] requests completed: ${summary}`);
+}
+
 /**
  * Core scraping function. Opens a browser context, navigates to the URL,
  * and returns the final HTML or JSON body.
@@ -400,21 +460,28 @@ export async function scrapeWithBrowser(
 
         page = await context.newPage();
 
-        const { jsonResponsePromise, captureHtmlPromise, skipCounts } = attachResponseListeners(
+        const { jsonResponsePromise, captureHtmlPromise, jsdVerifiedPromise, skipCounts, completedCounts } = attachResponseListeners(
             page, reqId, startTime, targetUrl, proxyOpts, loggers
         );
+        // Suppress unhandled rejection on captureHtmlPromise for paths that never await it
+        // (early JSON exit, page.goto throw, verify mode without reaching interceptPage, etc.)
+        captureHtmlPromise.catch(() => {});
 
-        // Intercept mode: abort everything except documents before it goes on the wire.
-        // No state, no bookkeeping — just kill non-document requests immediately.
-        if (!proxyOpts.render) {
+        // Intercept mode: abort all non-document requests before they hit the wire.
+        // verify skips this — CF's challenge/JSD scripts need to run and make network requests.
+        if (!proxyOpts.render && !proxyOpts.verify) {
             await page.route('**/*', (route: any) => {
                 route.request().resourceType() === 'document' ? route.continue() : route.abort('aborted');
             });
         }
 
         // Close the page as soon as we have the HTML — don't wait for goto/finally.
-        if (!proxyOpts.render) {
-            captureHtmlPromise.then(() => page.close().catch(() => {}));
+        // verify mode skips this: we keep the page alive to let JSD complete after HTML capture.
+        // .catch() on the chain is essential: if captureHtmlPromise rejects (e.g. document
+        // fetch fails) and we never reach interceptPage, the rejection must be handled here
+        // or Bun/Node will treat it as an unhandled rejection and crash the process.
+        if (!proxyOpts.render && !proxyOpts.verify) {
+            captureHtmlPromise.then(() => page.close().catch(() => {})).catch(() => {});
         }
 
         await page.goto(targetUrl, { waitUntil: 'commit', timeout: 30000 });
@@ -433,11 +500,23 @@ export async function scrapeWithBrowser(
 
         if (proxyOpts.render) {
             rawHtml = await renderPage(page, reqId, startTime, proxyOpts, loggers);
+            logCompletedCounts(completedCounts, reqId, startTime, loggers);
         } else {
             rawHtml = await interceptPage(page, reqId, startTime, proxyOpts, captureHtmlPromise, loggers);
-            if ((loggers.verbosity ?? 0) === 1 && Object.keys(skipCounts).length > 0) {
-                const summary = Object.entries(skipCounts).map(([t, n]) => `${t}×${n}`).join(', ');
+            if (Object.keys(skipCounts).length > 0) {
+                const summary = Object.entries(skipCounts).sort((a, b) => b[1] - a[1]).map(([t, n]) => `${t}:${n}`).join(', ');
                 loggers.info(`[#${reqId} +${ms(startTime)}ms] ✗ skipped: ${summary}`);
+            }
+            if (proxyOpts.verify) {
+                const JSD_TIMEOUT = 5000;
+                const timedOut = await Promise.race([
+                    jsdVerifiedPromise.then(() => false),
+                    new Promise<boolean>((r) => setTimeout(() => r(true), JSD_TIMEOUT)),
+                ]);
+                if (timedOut) {
+                    loggers.warn(`[#${reqId} +${ms(startTime)}ms] ⚠ verify: JSD oneshot not seen within ${JSD_TIMEOUT}ms — CF may not have verified`);
+                }
+                logCompletedCounts(completedCounts, reqId, startTime, loggers);
             }
         }
 

@@ -208,7 +208,10 @@ function buildRequestContext(c: import('hono').Context): RequestContext | Respon
         return c.text('Invalid URL provided', 400);
     }
 
-    const proxyOpts = parseProxyOptions(c.req.header('x-proxy-options'), GLOBAL_LOG_HTML);
+    const { opts: proxyOpts, errors: proxyOptErrors } = parseProxyOptions(c.req.header('x-proxy-options'), GLOBAL_LOG_HTML);
+    if (proxyOptErrors.length > 0) {
+        return c.json({ error: 'Invalid X-Proxy-Options', details: proxyOptErrors }, 400);
+    }
 
     const reqHeaders: Record<string, string> = {};
     c.req.raw.headers.forEach((v, k) => { reqHeaders[k] = v; });
@@ -219,6 +222,7 @@ function buildRequestContext(c: import('hono').Context): RequestContext | Respon
 
     const tags = [
         proxyOpts.render ? 'render' : null,
+        proxyOpts.verify ? 'verify' : null,
         proxyOpts.logHtml ? 'log-html' : null,
         proxyOpts.selector ? `selector=${proxyOpts.selector}` : null,
         proxyOpts.refreshCookies ? 'refresh-cookies' : null,
@@ -308,7 +312,7 @@ app.post('/:version{v\\d+}/extract', async (c) => {
     consola.info(`[#${reqId}] ZYTE POST /${version}/extract key=${apiKey.slice(0, 4)}… url=${targetUrl}`);
 
     const zyteProxyOpts: ProxyOptions = {
-        render: false, logHtml: false, wait: 20000, selector: null, settle: 1000, refreshCookies: false, screenshot: false,
+        render: false, verify: false, logHtml: false, wait: 20000, loadState: 'load', selector: null, settle: 1000, refreshCookies: false, screenshot: false,
     };
     const zyteLoggers: ScrapeLoggers = {
         info: (msg) => consola.info(msg),
