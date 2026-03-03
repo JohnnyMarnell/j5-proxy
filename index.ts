@@ -49,6 +49,7 @@ cli
     .option('-p, --port <port>', 'Server port', { default: 8787 })
     .option('-t, --ttl <ms>', 'Cookie cache TTL (ms)', { default: 3600000 })
     .option('--log-html', 'Log HTML at each pipeline step to stdout', { default: false })
+    .option('-v, --verbose', 'Log full HTML at every pipeline step (implies --log-html)', { default: false })
     .option('--log-file <path>', 'Path for the JSONL request log', { default: '/tmp/j5-proxy.jsonl' })
     .option('-i, --idle <ms>', 'Auto-shutdown after ms of inactivity (0 to disable)', { default: 1800000 })
     .option('--throttle-interval <ms>', 'Cache responses for this many ms', { default: 5000 })
@@ -64,7 +65,8 @@ const opts = parsed.options;
 
 const PORT: number = Number(opts.port);
 const COOKIE_CACHE_TTL: number = Number(opts.ttl);
-const GLOBAL_LOG_HTML: boolean = opts.logHtml as boolean;
+const VERBOSE: boolean = opts.verbose as boolean;
+const GLOBAL_LOG_HTML: boolean = VERBOSE || (opts.logHtml as boolean);
 const LOG_FILE: string = opts.logFile as string;
 const IDLE_TIMEOUT: number = Number(opts.idle);
 const THROTTLE_INTERVAL: number = Number(opts.throttleInterval);
@@ -127,8 +129,8 @@ function logToFile(entry: Record<string, any>) {
 
 // --- HTML STEP LOGGER ---
 function logHtmlStep(reqId: number, label: string, html: string, url: string, elapsedMs: number, reqHeaders: Record<string, string>, proxyOpts: ProxyOptions) {
-    const preview = html.length > 500 ? html.substring(0, 500) + `... (${html.length} chars total)` : html;
-    consola.info(`\n[#${reqId} +${elapsedMs}ms HTML:${label}] ${url}\n${'─'.repeat(60)}\n${preview}\n${'─'.repeat(60)}`);
+    const body = VERBOSE ? html : (html.length > 500 ? html.substring(0, 500) + `... (${html.length} chars total)` : html);
+    consola.info(`\n[#${reqId} +${elapsedMs}ms HTML:${label}] ${url}\n${'─'.repeat(60)}\n${body}\n${'─'.repeat(60)}`);
     logToFile({
         ts: new Date().toISOString(),
         reqId,
@@ -367,6 +369,7 @@ app.get('/*', async (c) => {
         const loggers: ScrapeLoggers = {
             info: (msg) => consola.info(msg),
             warn: (msg) => consola.warn(msg),
+            verbose: VERBOSE,
             onFirstResponse: (status, bytes, ms) => logToFile({
                 ts: new Date().toISOString(), reqId: ctx.reqId, elapsed: ms, step: 'first-response',
                 request: { url: ctx.targetUrl, headers: ctx.reqHeaders, proxyOptions: ctx.proxyOpts },
