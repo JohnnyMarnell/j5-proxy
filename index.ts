@@ -23,6 +23,7 @@ if (!process.stdout.isTTY) {
 import { chromium } from 'playwright-extra';
 import stealth from 'puppeteer-extra-plugin-stealth';
 import { execSync } from 'child_process';
+import notifier from 'node-notifier';
 import { appendFileSync } from 'node:fs';
 import { parseProxyOptions, getCacheKey, summarizeBody, stripHopByHop, ResponseCache, validateZyteAuth } from './lib';
 import type { ProxyOptions, CachedResponse } from './lib';
@@ -40,6 +41,7 @@ cli
   .option('-i, --idle <ms>', 'Auto-shutdown after ms of inactivity', { default: 1800000 })
   .option('--throttle-interval <ms>', 'Cache responses for this many ms', { default: 5000 })
   .option('--throttle-regex <pattern>', 'Only cache URLs matching this regex', { default: '.*' })
+  .option('--notify', 'Send OS notification on non-2XX responses (use --no-notify to disable)', { default: true })
   .help();
 
 const parsed = cli.parse();
@@ -53,6 +55,7 @@ const LOG_FILE: string = opts.logFile as string;
 const IDLE_TIMEOUT: number = Number(opts.idle);
 const THROTTLE_INTERVAL: number = Number(opts.throttleInterval);
 const THROTTLE_REGEX = new RegExp(opts.throttleRegex as string);
+const NOTIFY_ON_ERROR: boolean = opts.notify as boolean;
 
 // --- DEBOUNCED CLEANUP ERROR LOGGING ---
 let cleanupErrorCount = 0;
@@ -71,11 +74,17 @@ function logCleanupError() {
 
 // --- OS NOTIFICATIONS ---
 function notify(title: string, message: string) {
-    try {
-        execSync(`osascript -e 'display notification "${message}" with title "${title}"'`, { stdio: 'ignore' });
-    } catch {
-        // Ignore if not on macOS or notifications unavailable
-    }
+    notifier.notify({ title, message, sound: false });
+}
+
+function notifyError(reqId: number, status: number, url: string) {
+    if (!NOTIFY_ON_ERROR) return;
+    const short = url.length > 60 ? url.substring(0, 57) + '…' : url;
+    notifier.notify({
+        title: `Proxy ⚠ ${status}`,
+        message: `[#${reqId}] ${short}`,
+        sound: true,
+    });
 }
 
 // --- JSONL LOGGER ---
@@ -416,8 +425,10 @@ function logCompletion(ctx: RequestContext, responseStatus: number, responseBody
     // For non-2XX, include status line and body summary
     const bodySummary = (responseStatus < 200 || responseStatus >= 300) ? ` body=${summarizeBody(responseBody)}` : '';
 
-    const logFn = responseStatus >= 200 && responseStatus < 300 ? consola.success : consola.warn;
+    const isSuccess = responseStatus >= 200 && responseStatus < 300;
+    const logFn = isSuccess ? consola.success : consola.warn;
     logFn(`[#${ctx.reqId}] GET ${truncUrl} → ${responseStatus} (${responseBody.length}B) ${duration}ms${cacheStatus}${proxyOptsStr}${errorStr}${bodySummary}`);
+    if (!isSuccess) notifyError(ctx.reqId, responseStatus, ctx.targetUrl);
 
     logToFile({
         ts: new Date().toISOString(),
@@ -554,7 +565,10 @@ app.post('/:version{v\\d+}/extract', async (c) => {
         responseBody = result.body;
 
         const duration = Date.now() - startTime;
-        consola.success(`[#${reqId}] ZYTE ${targetUrl.substring(0, 70)} → ${responseStatus} (${responseBody.length}B) ${duration}ms`);
+        const zyteSuccess = responseStatus >= 200 && responseStatus < 300;
+        const zyteLogFn = zyteSuccess ? consola.success : consola.warn;
+        zyteLogFn(`[#${reqId}] ZYTE ${targetUrl.substring(0, 70)} → ${responseStatus} (${responseBody.length}B) ${duration}ms`);
+        if (!zyteSuccess) notifyError(reqId, responseStatus, targetUrl);
         logToFile({
             ts: new Date().toISOString(),
             reqId,
@@ -578,6 +592,7 @@ app.post('/:version{v\\d+}/extract', async (c) => {
     } catch (error: any) {
         const duration = Date.now() - startTime;
         consola.error(`[#${reqId}] ZYTE error ${targetUrl}: ${error.message}`);
+        notifyError(reqId, 500, targetUrl);
         logToFile({
             ts: new Date().toISOString(),
             reqId,
