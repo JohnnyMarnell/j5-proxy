@@ -74,17 +74,17 @@ function checkPrereqs(): void {
         consola.warn(`Running on ${process.platform}, not macOS. Chrome cookie extraction will likely fail. YMMV.`);
     }
 
-    // Python: required for cookies.py
-    let pythonFound = false;
+    // Python + browser_cookie3: required for cookies.py
+    let pythonCmd: string | null = null;
     for (const cmd of ['python', 'python3']) {
         try {
-            execSync(`${cmd} --version`, { stdio: 'pipe' });
-            pythonFound = true;
+            execSync(`${cmd} -c "import browser_cookie3"`, { stdio: 'pipe' });
+            pythonCmd = cmd;
             break;
         } catch {}
     }
-    if (!pythonFound) {
-        consola.error('Python not found. cookies.py requires Python to extract Chrome cookies. Install Python and retry.');
+    if (!pythonCmd) {
+        consola.error('Python library "browser_cookie3" not found. Install it with: pip install browser-cookie3');
         process.exit(1);
     }
 
