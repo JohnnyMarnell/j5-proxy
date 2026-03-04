@@ -15,6 +15,8 @@ import {
     checkCookiePrereqs,
     cookiesAvailable,
     logCleanupError,
+    closeBrowser,
+    type BrowserHandle,
     type ScrapeLoggers,
 } from './core';
 import {
@@ -159,7 +161,7 @@ if (idleInterval) idleInterval.unref();
 
 // --- SHUTDOWN ---
 let shuttingDown = false;
-let browser: any;
+let browserHandle: BrowserHandle | null = null;
 
 async function shutdown(reason = 'signal') {
     if (shuttingDown) return;
@@ -167,7 +169,7 @@ async function shutdown(reason = 'signal') {
     if (idleInterval) clearInterval(idleInterval);
     consola.warn(`Shutting down (${reason})...`);
     notify('j5-proxy shutting down', `Reason: ${reason}`);
-    if (browser) await browser.close().catch(() => {});
+    if (browserHandle) await closeBrowser(browserHandle).catch(() => {});
     process.exit(0);
 }
 
@@ -323,8 +325,11 @@ app.post('/:version{v\\d+}/extract', async (c) => {
 
     try {
         const cookies = cookiesAvailable ? getCookies(false, COOKIE_CACHE_TTL) : [];
+        if (!browserHandle) {
+            return c.json({ type: '/error/internal', title: 'Internal Error', status: 500, detail: 'Browser not initialized' }, 500);
+        }
         const output = await scrapeWithBrowser(
-            browser, reqId, startTime, targetUrl, zyteProxyOpts, cookies, zyteLoggers, (msg) => consola.warn(msg)
+            browserHandle, reqId, startTime, targetUrl, zyteProxyOpts, cookies, zyteLoggers, (msg) => consola.warn(msg)
         );
 
         const duration = Date.now() - startTime;
@@ -369,6 +374,15 @@ app.get('/*', async (c) => {
     let screenshotPath: string | undefined;
 
     try {
+        if (!browserHandle) {
+            const msg = 'Browser not initialized';
+            logToFile({
+                ts: new Date().toISOString(), reqId: ctx.reqId, duration: elapsed(ctx), method: 'GET',
+                url: ctx.targetUrl, status: 503, error: msg,
+            });
+            return c.text(msg, 503);
+        }
+
         const cookies = cookiesAvailable ? getCookies(ctx.proxyOpts.refreshCookies, COOKIE_CACHE_TTL) : [];
 
         const loggers: ScrapeLoggers = {
@@ -397,7 +411,7 @@ app.get('/*', async (c) => {
         };
 
         const output = await scrapeWithBrowser(
-            browser, ctx.reqId, ctx.startTime, ctx.targetUrl, ctx.proxyOpts, cookies, loggers, (msg) => consola.warn(msg)
+            browserHandle, ctx.reqId, ctx.startTime, ctx.targetUrl, ctx.proxyOpts, cookies, loggers, (msg) => consola.warn(msg)
         );
 
         responseStatus = output.status;
@@ -429,7 +443,7 @@ checkPrereqs();
 async function initBrowser() {
     consola.start(`Booting ${USE_CHROME ? 'Chrome (persistent context)' : 'Chromium'}...`);
     const initialCookies = USE_CHROME && cookiesAvailable ? getCookies(false, COOKIE_CACHE_TTL) : [];
-    browser = await launchBrowser(USE_CHROME, initialCookies);
+    browserHandle = await launchBrowser(USE_CHROME, initialCookies);
     const cookieNote = USE_CHROME ? ` — ${initialCookies.length} cookie(s) loaded into persistent context` : '';
     consola.ready(`${USE_CHROME ? 'Chrome' : 'Chromium'} ready${cookieNote}.`);
 }

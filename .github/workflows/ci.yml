@@ -57,3 +57,5 @@ jobs:
       # E2E tests don't assert on cookie behaviour so no pip install needed.
       - name: Run E2E tests
         run: bun test e2e/ --timeout 60000
+        env:
+          VERBOSE: "1"
