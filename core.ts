@@ -5,6 +5,7 @@ import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import consola from 'consola';
 import type { ProxyOptions } from './lib';
 
 
@@ -133,6 +134,8 @@ export function getCookies(forceRefresh = false, ttl = 3_600_000): any[] {
 
     const now = Date.now();
     if (!forceRefresh && _cachedCookies.length > 0 && now - _lastCookieFetch < ttl) {
+        const ageS = Math.round((now - _lastCookieFetch) / 1000);
+        consola.info(`🍪 Using cached cookies (${_cachedCookies.length} cookies, age ${ageS}s)`);
         return _cachedCookies;
     }
 
@@ -142,10 +145,31 @@ export function getCookies(forceRefresh = false, ttl = 3_600_000): any[] {
         if (parsed.error) throw new Error(parsed.error);
         _cachedCookies = parsed;
         _lastCookieFetch = now;
+        consola.info(`🍪 Fetched fresh cookies (${_cachedCookies.length} cookies)`);
         return _cachedCookies;
     } catch (err: any) {
         if (forceRefresh) throw err;
+        consola.warn(`🍪 Cookie fetch failed, using stale cache (${_cachedCookies.length} cookies): ${(err as any).message}`);
         return _cachedCookies; // return stale on silent failure
+    }
+}
+
+// --- COOKIE FILTERING ---
+
+/**
+ * Filters a cookie jar down to cookies whose domain matches the target URL.
+ * Handles the leading-dot convention (.example.com matches sub.example.com).
+ */
+export function filterCookiesForUrl(cookies: any[], targetUrl: string): any[] {
+    if (cookies.length === 0) return cookies;
+    try {
+        const hostname = new URL(targetUrl).hostname;
+        return cookies.filter(c => {
+            const domain = c.domain?.startsWith('.') ? c.domain.slice(1) : c.domain;
+            return domain && (hostname === domain || hostname.endsWith('.' + domain));
+        });
+    } catch {
+        return cookies;
     }
 }
 
@@ -177,6 +201,7 @@ export interface ScrapeOutput {
     body: string;
     headers: Record<string, string>;
     screenshotPath?: string;
+    cookiesApplied?: number;
 }
 
 
@@ -471,17 +496,26 @@ export async function scrapeWithBrowser(
     let context: any;
     let ownContext = false; // whether we created the context and should close it
     let page: any;
+    let cookiesApplied: number | undefined;
     try {
         if (handle.kind === 'chrome') {
             context = handle.context;
             // Refresh cookies into the persistent context if explicitly requested
             if (proxyOpts.refreshCookies && cookies.length > 0) {
+                const filtered = filterCookiesForUrl(cookies, targetUrl);
                 await context.clearCookies();
-                await context.addCookies(cookies);
+                await context.addCookies(filtered);
+                cookiesApplied = filtered.length;
+                loggers.info?.(`[#${reqId}] 🍪 Refreshed ${filtered.length}/${cookies.length} cookies into persistent Chrome context`);
             }
         } else {
             context = await handle.browser.newContext({ viewport: { width: 1280, height: 720 } });
-            if (cookies.length > 0) await context.addCookies(cookies);
+            if (cookies.length > 0) {
+                const filtered = filterCookiesForUrl(cookies, targetUrl);
+                if (filtered.length > 0) await context.addCookies(filtered);
+                cookiesApplied = filtered.length;
+                loggers.info?.(`[#${reqId}] 🍪 Injected ${filtered.length}/${cookies.length} cookies into Chromium context`);
+            }
             ownContext = true;
         }
 
@@ -519,7 +553,7 @@ export async function scrapeWithBrowser(
             new Promise<null>((resolve) => setTimeout(() => resolve(null), 500)),
         ]);
         if (jsonEarlyExit) {
-            return { isJson: true, status: jsonEarlyExit.status, body: jsonEarlyExit.body, headers: jsonEarlyExit.headers };
+            return { isJson: true, status: jsonEarlyExit.status, body: jsonEarlyExit.body, headers: jsonEarlyExit.headers, cookiesApplied };
         }
 
         let screenshotPath: string | undefined;
@@ -552,7 +586,7 @@ export async function scrapeWithBrowser(
             screenshotPath = await captureScreenshotAsync(page, targetUrl, reqId, startTime, loggers);
         }
 
-        return { isJson: false, status: 200, body: rawHtml, headers: { 'content-type': 'text/html; charset=utf-8' }, screenshotPath };
+        return { isJson: false, status: 200, body: rawHtml, headers: { 'content-type': 'text/html; charset=utf-8' }, screenshotPath, cookiesApplied };
     } finally {
         if (page) await page.close().catch(() => logCleanupError(warnCleanup));
         if (ownContext && context) await context.close().catch(() => logCleanupError(warnCleanup));

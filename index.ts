@@ -334,7 +334,8 @@ app.post('/:version{v\\d+}/extract', async (c) => {
 
         const duration = Date.now() - startTime;
         const ok = output.status >= 200 && output.status < 300;
-        (ok ? consola.success : consola.warn)(`[#${reqId}] ZYTE ${targetUrl.substring(0, 70)} → ${output.status} (${output.body.length}B) ${duration}ms`);
+        const cookieTag = output.cookiesApplied !== undefined ? ` [cookies=${output.cookiesApplied}]` : '';
+        (ok ? consola.success : consola.warn)(`[#${reqId}] ZYTE ${targetUrl.substring(0, 70)} → ${output.status} (${output.body.length}B) ${duration}ms${cookieTag}`);
         if (!ok) notifyError(reqId, output.status, targetUrl);
         logToFile({ ts: new Date().toISOString(), reqId, duration, method: 'ZYTE', url: targetUrl, status: output.status, bodyLength: output.body.length });
 
@@ -415,6 +416,7 @@ app.get('/*', async (c) => {
         );
 
         responseStatus = output.status;
+        if (output.cookiesApplied !== undefined) ctx.tags.push(`cookies=${output.cookiesApplied}`);
 
         if (output.isJson) {
             responseBody = output.body;
