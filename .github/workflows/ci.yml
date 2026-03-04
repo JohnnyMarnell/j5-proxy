@@ -39,19 +39,22 @@ jobs:
         with:
           bun-version: latest
 
-      # Skip postinstall (playwright install chromium) — we do it below with --with-deps
+      # Skip postinstall (patchright install chromium) — we do it below with --with-deps
       - run: bun install --ignore-scripts
 
-      # Cache the Playwright browser binary between runs
-      - name: Cache Playwright Chromium
+      # Cache the Patchright/Playwright browser binary between runs.
+      # Both patchright and playwright share ~/.cache/ms-playwright.
+      # Key includes the patchright version so a dep bump auto-invalidates.
+      - name: Cache Patchright Chromium
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          key: patchright-chromium-${{ runner.os }}-${{ hashFiles('bun.lock') }}
 
-      # Install Chromium + all Linux system deps (fonts, libs, etc.)
-      - name: Install Playwright Chromium
-        run: bunx playwright install --with-deps chromium
+      # Install Chromium + all Linux system deps (fonts, libs, etc.).
+      # Must use patchright (not playwright) — it pins a specific patched build.
+      - name: Install Patchright Chromium
+        run: bunx patchright install --with-deps chromium
 
       # Cookies are optional — proxy warns and continues without them.
       # E2E tests don't assert on cookie behaviour so no pip install needed.
