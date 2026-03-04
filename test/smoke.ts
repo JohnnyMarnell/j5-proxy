@@ -5,6 +5,7 @@
  * Usage:
  *   bun test/smoke.ts <config.json>
  *   bun test/smoke.ts '{"tests":[...]}'       # inline JSON
+ *   bun test/smoke.ts <config> --port 8787    # use already-running proxy
  *
  * Config schema:
  *   {
@@ -154,43 +155,66 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 // Main
 // ---------------------------------------------------------------------------
 
-const arg = process.argv[2];
-if (!arg) {
-    console.error('Usage: bun test/smoke.ts <config.json | inline-json>');
+const args = process.argv.slice(2);
+if (args.length === 0 || args[0]!.startsWith('-')) {
+    console.error('Usage: bun test/smoke.ts <config.json | inline-json> [--port <n>]');
     process.exit(1);
 }
 
-const config = loadConfig(arg);
-const port   = await getFreePort();
-const projectRoot = import.meta.dir + '/..';
+// Parse --port flag (points at an already-running proxy; skip launch)
+const portFlagIdx = args.indexOf('--port');
+const portFlagVal = portFlagIdx !== -1 ? (args[portFlagIdx + 1] ?? '') : '';
+const externalPort = portFlagVal ? parseInt(portFlagVal, 10) : null;
+if (portFlagIdx !== -1 && (externalPort === null || isNaN(externalPort) || externalPort < 1 || externalPort > 65535))
+    die(`Invalid --port value: ${portFlagVal}`);
 
+const config = loadConfig(args[0]!);
+const projectRoot = import.meta.dir + '/..';
 const divider = '─'.repeat(64);
 
-console.log(`\n${divider}`);
-console.log(`🔧  Starting proxy on port ${port}  (${config.tests.length} test(s) queued)`);
-console.log(`${divider}\n`);
+let port: number;
+let proxyProc: ReturnType<typeof spawn> | null = null;
 
-const proxyProc = spawn({
-    cmd: ['bun', 'index.ts', '-p', String(port), '--idle', '0', '--no-startup-notify', '--no-notify', '-v'],
-    cwd: projectRoot,
-    stdout: 'inherit',
-    stderr: 'inherit',
-});
+if (externalPort) {
+    port = externalPort;
+    console.log(`\n${divider}`);
+    console.log(`🔌  Using existing proxy at port ${port}  (${config.tests.length} test(s) queued)`);
+    console.log(`${divider}\n`);
 
-// Wait for proxy ready
-const startWait = Date.now();
-let ready = false;
-while (Date.now() - startWait < 20_000) {
+    // Verify it's actually reachable
     try {
-        await fetch(`http://localhost:${port}/favicon.ico`);
-        ready = true;
-        break;
-    } catch { await Bun.sleep(200); }
-}
+        await withTimeout(fetch(`http://localhost:${port}/favicon.ico`), 3000, 'proxy reachability check');
+    } catch {
+        die(`No proxy responding at http://localhost:${port} — is it running?`);
+    }
+} else {
+    port = await getFreePort();
 
-if (!ready) {
-    proxyProc.kill();
-    die('Proxy failed to start within 20s');
+    console.log(`\n${divider}`);
+    console.log(`🔧  Starting proxy on port ${port}  (${config.tests.length} test(s) queued)`);
+    console.log(`${divider}\n`);
+
+    proxyProc = spawn({
+        cmd: ['bun', 'index.ts', '-p', String(port), '--idle', '0', '--no-startup-notify', '--no-notify', '-v'],
+        cwd: projectRoot,
+        stdout: 'inherit',
+        stderr: 'inherit',
+    });
+
+    const startWait = Date.now();
+    let ready = false;
+    while (Date.now() - startWait < 20_000) {
+        try {
+            await fetch(`http://localhost:${port}/favicon.ico`);
+            ready = true;
+            break;
+        } catch { await Bun.sleep(200); }
+    }
+
+    if (!ready) {
+        proxyProc.kill();
+        die('Proxy failed to start within 20s');
+    }
 }
 
 console.log(`\n${divider}`);
@@ -213,6 +237,10 @@ const results: TestResult[] = await Promise.all(config.tests.map(async (test, i)
         const res  = await withTimeout(fetch(proxyUrl, { headers }), ms, label);
         const body = await res.text();
         const elapsed = Date.now() - t0;
+
+        if (res.status < 200 || res.status >= 300)
+            return { label, pass: false, status: res.status, bytes: body.length, ms: elapsed,
+                reason: `Non-2XX response` };
 
         if (test.responseType === 'json') {
             const ct = res.headers.get('content-type') ?? '';
@@ -260,5 +288,5 @@ console.log(`\n${divider}`);
 console.log(`    ${passed} passed  ·  ${failed} failed`);
 console.log(`${divider}\n`);
 
-proxyProc.kill();
+proxyProc?.kill();
 process.exit(failed > 0 ? 1 : 0);

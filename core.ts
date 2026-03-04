@@ -225,6 +225,8 @@ function sanitizeUrlForFilename(url: string): string {
     }
 }
 
+const SCREENSHOT_TIMEOUT_MS = 10_000;
+
 // Screenshot capture — doesn't block request, errors are silently logged
 export async function captureScreenshotAsync(
     page: any,
@@ -237,7 +239,12 @@ export async function captureScreenshotAsync(
         const sanitized = sanitizeUrlForFilename(url);
         const timestamp = Date.now();
         const filename = join(tmpdir(), `${sanitized}_${timestamp}.png`);
-        await page.screenshot({ path: filename, fullPage: true });
+        await Promise.race([
+            page.screenshot({ path: filename, fullPage: true }),
+            new Promise<never>((_, reject) =>
+                setTimeout(() => reject(new Error(`screenshot timed out after ${SCREENSHOT_TIMEOUT_MS}ms`)), SCREENSHOT_TIMEOUT_MS)
+            ),
+        ]);
         loggers.info(`[#${reqId}] Screenshot saved: ${filename}`);
         loggers.onScreenshot?.(filename, ms(startTime));
         return filename;
@@ -350,7 +357,11 @@ export function attachResponseListeners(
         try {
             const text = await response.text();
 
-            if (isJson) {
+            // Only treat document navigations returning JSON as "the JSON response".
+            // XHR/fetch from CF challenge scripts also appear on the main frame and
+            // can have application/json content-type — resolving here with their body
+            // would return CF-internal data instead of the real API response.
+            if (isJson && isDocument) {
                 const elapsed = ms(startTime);
                 loggers.info(`[#${reqId} +${elapsed}ms] JSON response: ${response.status()} (${text.length} bytes)`);
                 const upstreamHeaders: Record<string, string> = {};
@@ -535,8 +546,6 @@ export async function scrapeWithBrowser(
         jsonResponsePromise.catch(() => {});
         cfChallengeDetected.catch(() => {});
 
-        // Intercept mode: abort all non-document requests before they hit the wire.
-        // verify skips this — CF's challenge/JSD scripts need to run and make network requests.
         // Close the page as soon as we have the HTML or JSON — don't wait for goto/finally.
         // verify mode skips this: we keep the page alive to let JSD complete after HTML capture.
         // .catch() on the chain is essential: if captureHtmlPromise rejects (e.g. document
@@ -549,24 +558,24 @@ export async function scrapeWithBrowser(
 
         await page.goto(targetUrl, { waitUntil: 'commit', timeout: 30000 });
 
-        // 500ms window to detect a JSON response before committing to the HTML pipeline.
-        // Fast JSON APIs (no CF challenge) resolve here. Slower ones (post-CF-bypass) are
-        // caught inside interceptPage which also races jsonResponsePromise.
-        const jsonEarlyExit = await Promise.race([
-            jsonResponsePromise,
-            new Promise<null>((resolve) => setTimeout(() => resolve(null), 500)),
-        ]);
-        if (jsonEarlyExit) {
-            return { isJson: true, status: jsonEarlyExit.status, body: jsonEarlyExit.body, headers: jsonEarlyExit.headers, cookiesApplied };
-        }
-
         let screenshotPath: string | undefined;
         let rawHtml: string;
 
         if (proxyOpts.render) {
+            // In render mode we can't use interceptPage, so give JSON a short window to
+            // resolve before committing to renderPage (which would wrap JSON in an HTML shell).
+            const jsonEarlyExit = await Promise.race([
+                jsonResponsePromise,
+                new Promise<null>((resolve) => setTimeout(() => resolve(null), 500)),
+            ]);
+            if (jsonEarlyExit) {
+                return { isJson: true, status: jsonEarlyExit.status, body: jsonEarlyExit.body, headers: jsonEarlyExit.headers, cookiesApplied };
+            }
             rawHtml = await renderPage(page, reqId, startTime, proxyOpts, loggers);
             logCompletedCounts(completedCounts, reqId, startTime, loggers);
         } else {
+            // interceptPage races captureHtmlPromise and jsonResponsePromise together —
+            // no artificial delay needed regardless of which arrives first or how slow CF is.
             const interceptResult = await interceptPage(page, reqId, startTime, proxyOpts, captureHtmlPromise, jsonResponsePromise, loggers);
             if (interceptResult.isJson) {
                 return { isJson: true, status: interceptResult.json.status, body: interceptResult.json.body, headers: interceptResult.json.headers, cookiesApplied };
