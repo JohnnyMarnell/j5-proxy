@@ -254,13 +254,15 @@ export function attachResponseListeners(
     targetUrl: string,
     proxyOpts: ProxyOptions,
     loggers: ScrapeLoggers = SILENT,
-): { jsonResponsePromise: Promise<{ body: string; headers: Record<string, string>; status: number }>; captureHtmlPromise: Promise<string>; jsdVerifiedPromise: Promise<void>; skipCounts: Record<string, number>; completedCounts: Record<string, number> } {
+): { jsonResponsePromise: Promise<{ body: string; headers: Record<string, string>; status: number }>; captureHtmlPromise: Promise<string>; jsdVerifiedPromise: Promise<void>; cfChallengeDetected: Promise<void>; skipCounts: Record<string, number>; completedCounts: Record<string, number> } {
     let firstResponseLogged = false;
     let resolveJson!: (r: { body: string; headers: Record<string, string>; status: number }) => void;
     const jsonResponsePromise = new Promise<{ body: string; headers: Record<string, string>; status: number }>((r) => { resolveJson = r; });
     let resolveCapture!: (html: string) => void;
     let rejectCapture!: (err: Error) => void;
     const captureHtmlPromise = new Promise<string>((resolve, reject) => { resolveCapture = resolve; rejectCapture = reject; });
+    let resolveCfChallenge!: () => void;
+    const cfChallengeDetected = new Promise<void>((r) => { resolveCfChallenge = r; });
     const skipCounts: Record<string, number> = {};
     const completedCounts: Record<string, number> = {};
     const verbosity = loggers.verbosity ?? 0;
@@ -367,31 +369,24 @@ export function attachResponseListeners(
                 loggers.onFirstResponse?.(response.status(), text.length, elapsed);
                 if (isCloudflareChallenge(text)) {
                     cfChallengeSeen = true;
-                    if (proxyOpts.verify) {
-                        loggers.info(`[#${reqId} +${ms(startTime)}ms] ✓ CF challenge page detected — waiting for bypass`);
-                    } else {
-                        loggers.warn(`[#${reqId} +${ms(startTime)}ms] ⚠ CF challenge page detected — returning challenge HTML, use verify to bypass`);
-                    }
+                    resolveCfChallenge();
+                    loggers.info(`[#${reqId} +${ms(startTime)}ms] ✓ CF challenge page detected — waiting for bypass`);
                 }
             }
 
             if (isDocument && !proxyOpts.render) {
-                if (text.length > 1000) {
-                    if (proxyOpts.verify && isCloudflareChallenge(text)) {
-                        // Hold — wait for the real page after challenge completes
-                    } else {
-                        if (proxyOpts.verify) {
-                            if (cfChallengeSeen) {
-                                loggers.info(`[#${reqId} +${ms(startTime)}ms] ✓ CF bypass complete — real content received`);
-                            } else {
-                                loggers.info(`[#${reqId} +${ms(startTime)}ms] ✓ verify: no CF challenge, real content received`);
-                            }
-                        }
-                        if (proxyOpts.logHtml) {
-                            loggers.onHtmlStep?.('intercepted-response', text, ms(startTime));
-                        }
-                        resolveCapture(text);
+                if (isCloudflareChallenge(text)) {
+                    // Always hold — real content arrives after CF bypass completes
+                } else {
+                    if (cfChallengeSeen) {
+                        loggers.info(`[#${reqId} +${ms(startTime)}ms] ✓ CF bypass complete — real content received`);
+                    } else if (proxyOpts.verify) {
+                        loggers.info(`[#${reqId} +${ms(startTime)}ms] ✓ verify: no CF challenge, real content received`);
                     }
+                    if (proxyOpts.logHtml) {
+                        loggers.onHtmlStep?.('intercepted-response', text, ms(startTime));
+                    }
+                    resolveCapture(text);
                 }
             }
         } catch {
@@ -399,7 +394,7 @@ export function attachResponseListeners(
         }
     });
 
-    return { jsonResponsePromise, captureHtmlPromise, jsdVerifiedPromise, skipCounts, completedCounts };
+    return { jsonResponsePromise, captureHtmlPromise, jsdVerifiedPromise, cfChallengeDetected, skipCounts, completedCounts };
 }
 
 export async function renderPage(
@@ -444,28 +439,33 @@ export async function renderPage(
     return rawHtml;
 }
 
+type JsonResult = { body: string; headers: Record<string, string>; status: number };
+type InterceptResult = { isJson: false; html: string } | { isJson: true; json: JsonResult };
+
 export async function interceptPage(
     page: any,
     reqId: number,
     startTime: number,
     proxyOpts: ProxyOptions,
     captureHtmlPromise: Promise<string>,
+    jsonResponsePromise: Promise<JsonResult>,
     loggers: ScrapeLoggers = SILENT,
-): Promise<string> {
+): Promise<InterceptResult> {
     try {
         return await Promise.race([
-            captureHtmlPromise,
-            new Promise<string>((_, reject) =>
-                setTimeout(() => reject(new Error('Timeout waiting for real HTML (Cloudflare might be stuck)')), 25000)
+            captureHtmlPromise.then(html => ({ isJson: false as const, html })),
+            jsonResponsePromise.then(json => ({ isJson: true as const, json })),
+            new Promise<never>((_, reject) =>
+                setTimeout(() => reject(new Error('Timeout waiting for real content (Cloudflare might be stuck)')), 25000)
             ),
         ]);
     } catch {
         loggers.warn(`[#${reqId} +${ms(startTime)}ms] Intercept timed out, falling back to live DOM.`);
-        const rawHtml = await page.content();
+        const html = await page.content();
         if (proxyOpts.logHtml) {
-            loggers.onHtmlStep?.('fallback-dom', rawHtml, ms(startTime));
+            loggers.onHtmlStep?.('fallback-dom', html, ms(startTime));
         }
-        return rawHtml;
+        return { isJson: false, html };
     }
 }
 
@@ -492,6 +492,7 @@ export async function scrapeWithBrowser(
     cookies: any[] = [],
     loggers: ScrapeLoggers = SILENT,
     warnCleanup: (msg: string) => void = () => {},
+    userAgent?: string,
 ): Promise<ScrapeOutput> {
     let context: any;
     let ownContext = false; // whether we created the context and should close it
@@ -509,45 +510,48 @@ export async function scrapeWithBrowser(
                 loggers.info?.(`[#${reqId}] 🍪 Refreshed ${filtered.length}/${cookies.length} cookies into persistent Chrome context`);
             }
         } else {
-            context = await handle.browser.newContext({ viewport: { width: 1280, height: 720 } });
+            context = await handle.browser.newContext({
+                ...(userAgent ? { userAgent } : {}),
+                viewport: { width: 1280, height: 720 },
+            });
             if (cookies.length > 0) {
                 const filtered = filterCookiesForUrl(cookies, targetUrl);
-                if (filtered.length > 0) await context.addCookies(filtered);
-                cookiesApplied = filtered.length;
-                loggers.info?.(`[#${reqId}] 🍪 Injected ${filtered.length}/${cookies.length} cookies into Chromium context`);
+                if (filtered.length > 0) {
+                    await context.addCookies(filtered);
+                    cookiesApplied = filtered.length;
+                    loggers.info?.(`[#${reqId}] 🍪 Injected ${filtered.length}/${cookies.length} cookies into Chromium context`);
+                }
             }
             ownContext = true;
         }
 
         page = await context.newPage();
 
-        const { jsonResponsePromise, captureHtmlPromise, jsdVerifiedPromise, skipCounts, completedCounts } = attachResponseListeners(
+        const { jsonResponsePromise, captureHtmlPromise, jsdVerifiedPromise, cfChallengeDetected, skipCounts, completedCounts } = attachResponseListeners(
             page, reqId, startTime, targetUrl, proxyOpts, loggers
         );
-        // Suppress unhandled rejection on captureHtmlPromise for paths that never await it
-        // (early JSON exit, page.goto throw, verify mode without reaching interceptPage, etc.)
+        // Suppress unhandled rejections on promises that may never be awaited
         captureHtmlPromise.catch(() => {});
+        jsonResponsePromise.catch(() => {});
+        cfChallengeDetected.catch(() => {});
 
         // Intercept mode: abort all non-document requests before they hit the wire.
         // verify skips this — CF's challenge/JSD scripts need to run and make network requests.
-        if (!proxyOpts.render && !proxyOpts.verify) {
-            await page.route('**/*', (route: any) => {
-                route.request().resourceType() === 'document' ? route.continue() : route.abort('aborted');
-            });
-        }
-
-        // Close the page as soon as we have the HTML — don't wait for goto/finally.
+        // Close the page as soon as we have the HTML or JSON — don't wait for goto/finally.
         // verify mode skips this: we keep the page alive to let JSD complete after HTML capture.
         // .catch() on the chain is essential: if captureHtmlPromise rejects (e.g. document
         // fetch fails) and we never reach interceptPage, the rejection must be handled here
         // or Bun/Node will treat it as an unhandled rejection and crash the process.
         if (!proxyOpts.render && !proxyOpts.verify) {
             captureHtmlPromise.then(() => page.close().catch(() => {})).catch(() => {});
+            jsonResponsePromise.then(() => page.close().catch(() => {})).catch(() => {});
         }
 
         await page.goto(targetUrl, { waitUntil: 'commit', timeout: 30000 });
 
-        // 500ms window to detect a JSON response before committing to the HTML pipeline
+        // 500ms window to detect a JSON response before committing to the HTML pipeline.
+        // Fast JSON APIs (no CF challenge) resolve here. Slower ones (post-CF-bypass) are
+        // caught inside interceptPage which also races jsonResponsePromise.
         const jsonEarlyExit = await Promise.race([
             jsonResponsePromise,
             new Promise<null>((resolve) => setTimeout(() => resolve(null), 500)),
@@ -563,7 +567,11 @@ export async function scrapeWithBrowser(
             rawHtml = await renderPage(page, reqId, startTime, proxyOpts, loggers);
             logCompletedCounts(completedCounts, reqId, startTime, loggers);
         } else {
-            rawHtml = await interceptPage(page, reqId, startTime, proxyOpts, captureHtmlPromise, loggers);
+            const interceptResult = await interceptPage(page, reqId, startTime, proxyOpts, captureHtmlPromise, jsonResponsePromise, loggers);
+            if (interceptResult.isJson) {
+                return { isJson: true, status: interceptResult.json.status, body: interceptResult.json.body, headers: interceptResult.json.headers, cookiesApplied };
+            }
+            rawHtml = interceptResult.html;
             if (Object.keys(skipCounts).length > 0) {
                 const summary = Object.entries(skipCounts).sort((a, b) => b[1] - a[1]).map(([t, n]) => `${t}:${n}`).join(', ');
                 loggers.info(`[#${reqId} +${ms(startTime)}ms] ✗ skipped: ${summary}`);

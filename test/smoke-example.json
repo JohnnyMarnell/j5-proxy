@@ -1,0 +1,23 @@
+{
+  "timeout": 60000,
+  "tests": [
+    {
+      "name": "example.com HTML",
+      "url": "https://example.com",
+      "expect": "Example Domain"
+    },
+    {
+      "name": "httpbin JSON",
+      "url": "https://httpbin.org/get",
+      "responseType": "json",
+      "expect": "\"url\""
+    },
+    {
+      "name": "httpbin JSON with render",
+      "url": "https://httpbin.org/get",
+      "proxyOptions": "render",
+      "responseType": "json",
+      "expect": "\"url\""
+    }
+  ]
+}

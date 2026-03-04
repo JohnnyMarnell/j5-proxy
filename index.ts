@@ -63,6 +63,7 @@ const opts = yargs(hideBin(process.argv))
     .option('startup-notify',   {             type: 'boolean', default: true,           describe: 'OS notification on startup (--no-startup-notify to disable)' })
     .option('refresh-cookies',  {             type: 'boolean', default: false,          describe: 'Force fresh cookie extraction on startup' })
     .option('chrome',           {             type: 'boolean', default: false,          describe: 'Use real Chrome (persistent context) instead of Chromium' })
+    .option('ua',               {             type: 'string',  default: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36', describe: 'User-Agent for headless browser contexts (empty string to use browser default)' })
     .option('v',                {             count: true,                              describe: 'Verbosity: -v requests/aborts, -vv +truncated HTML, -vvv +full HTML' })
     .help()
     .parseSync();
@@ -79,6 +80,7 @@ const NOTIFY_ON_ERROR: boolean = opts.notify as boolean;
 const STARTUP_NOTIFY: boolean = opts.startupNotify as boolean;
 const REFRESH_COOKIES_ON_START: boolean = opts.refreshCookies as boolean;
 const USE_CHROME: boolean = opts.chrome as boolean;
+const USER_AGENT: string | undefined = (opts.ua as string) || undefined; // empty string → undefined → browser default
 
 // --- STARTUP PRE-REQUISITE CHECKS ---
 function checkPrereqs(): void {
@@ -329,12 +331,12 @@ app.post('/:version{v\\d+}/extract', async (c) => {
             return c.json({ type: '/error/internal', title: 'Internal Error', status: 500, detail: 'Browser not initialized' }, 500);
         }
         const output = await scrapeWithBrowser(
-            browserHandle, reqId, startTime, targetUrl, zyteProxyOpts, cookies, zyteLoggers, (msg) => consola.warn(msg)
+            browserHandle, reqId, startTime, targetUrl, zyteProxyOpts, cookies, zyteLoggers, (msg) => consola.warn(msg), USER_AGENT
         );
 
         const duration = Date.now() - startTime;
         const ok = output.status >= 200 && output.status < 300;
-        const cookieTag = output.cookiesApplied !== undefined ? ` [cookies=${output.cookiesApplied}]` : '';
+        const cookieTag = output.cookiesApplied ? ` [cookies=${output.cookiesApplied}]` : '';
         (ok ? consola.success : consola.warn)(`[#${reqId}] ZYTE ${targetUrl.substring(0, 70)} → ${output.status} (${output.body.length}B) ${duration}ms${cookieTag}`);
         if (!ok) notifyError(reqId, output.status, targetUrl);
         logToFile({ ts: new Date().toISOString(), reqId, duration, method: 'ZYTE', url: targetUrl, status: output.status, bodyLength: output.body.length });
@@ -412,11 +414,11 @@ app.get('/*', async (c) => {
         };
 
         const output = await scrapeWithBrowser(
-            browserHandle, ctx.reqId, ctx.startTime, ctx.targetUrl, ctx.proxyOpts, cookies, loggers, (msg) => consola.warn(msg)
+            browserHandle, ctx.reqId, ctx.startTime, ctx.targetUrl, ctx.proxyOpts, cookies, loggers, (msg) => consola.warn(msg), USER_AGENT
         );
 
         responseStatus = output.status;
-        if (output.cookiesApplied !== undefined) ctx.tags.push(`cookies=${output.cookiesApplied}`);
+        if (output.cookiesApplied) ctx.tags.push(`cookies=${output.cookiesApplied}`);
 
         if (output.isJson) {
             responseBody = output.body;
@@ -455,9 +457,11 @@ initBrowser().then(() => {
         const idleNote = IDLE_TIMEOUT > 0
             ? `⏱  Auto-shutdown after ${IDLE_TIMEOUT / 1000}s idle`
             : `⏱  Idle auto-shutdown disabled`;
+        const uaNote = USER_AGENT ? `🕵️  UA: ${USER_AGENT}` : `🕵️  UA: browser default (--ua to override)`;
         consola.box(
             `🚀 j5-proxy running at http://localhost:${info.port}\n` +
             `🌐 Browser: ${USE_CHROME ? 'Chrome (persistent context, --chrome)' : 'Chromium (default)'}\n` +
+            uaNote + '\n' +
             `📝 Logging requests to ${LOG_FILE}\n` +
             idleNote + '\n' +
             `⚡ Response throttle: ${THROTTLE_INTERVAL}ms, regex: ${opts.throttleRegex}\n` +

@@ -145,8 +145,10 @@ j5-proxy --chrome
 | Context | Fresh per request | Persistent across all requests |
 | Profile dir | n/a | `$TMPDIR/j5-proxy-chrome-profile` |
 | Viewport | 1280×720 | OS default (`viewport: null`) |
-| User agent | Chrome UA (patchright) | Real Chrome UA |
+| User agent | `--ua` value (macOS Chrome 120 by default) | Real Chrome UA |
 | Cookies | Injected per request | Injected at launch, cleared on refresh |
+
+The default `--ua` value (`Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36`) spoofs macOS Chrome and is important for avoiding Cloudflare challenges — particularly when your session cookies were extracted from a macOS Chrome browser. Pass `--ua ''` to let patchright supply its own UA.
 
 The persistent profile accumulates browsing history and storage across proxy restarts, which can help with fingerprint legitimacy. Install Chrome if not already present:
 
@@ -189,6 +191,7 @@ bun --hot index.ts --help
 | `--startup-notify` / `--no-startup-notify` | `true` | OS notification on startup |
 | `--refresh-cookies` | `false` | Force fresh cookie extraction on startup |
 | `--chrome` | `false` | Use real Chrome with persistent context instead of Chromium |
+| `--ua` | macOS Chrome 120 UA | User-Agent string for headless browser contexts. Pass `--ua ''` to use the browser's own default UA |
 | `-v` / `-vv` / `-vvv` | off | Verbosity (see below) |
 
 ### Verbosity levels

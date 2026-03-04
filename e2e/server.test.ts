@@ -24,7 +24,6 @@ beforeAll(async () => {
             const url = new URL(req.url);
 
             if (url.pathname === '/html') {
-                // Make response > 1000 bytes so proxy's HTML interception captures it
                 const htmlContent = `<!DOCTYPE html>
 <html>
 <head>
@@ -34,16 +33,7 @@ beforeAll(async () => {
 </head>
 <body>
     <h1>Hello from mock server</h1>
-    <p>This is a test HTML response with enough content to pass the proxy's >1000 byte filter.</p>
-    <div class="content">
-        <p>Additional paragraph 1: Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.</p>
-        <p>Additional paragraph 2: Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.</p>
-        <p>Additional paragraph 3: Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur.</p>
-        <p>Additional paragraph 4: Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.</p>
-    </div>
-    <footer>
-        <p>Test content to ensure response size exceeds 1000 bytes for proxy HTML interception.</p>
-    </footer>
+    <p>This is a test HTML response.</p>
 </body>
 </html>`;
                 return new Response(htmlContent, { headers: { 'content-type': 'text/html; charset=utf-8' } });
@@ -70,11 +60,8 @@ beforeAll(async () => {
                 );
             }
 
-            // wait-for test: span starts as "initial"; JS changes it to "updated"
-            // after 200ms and stamps data-ready on <body>.  Response is >1000 bytes
-            // so the proxy intercept filter captures it in non-render mode too.
             if (url.pathname === '/wait-for-test') {
-                const padding = '<!-- ' + 'x'.repeat(1100) + ' -->';
+                const padding = '';
                 const html = `<!DOCTYPE html>
 <html>
 <head><title>WaitFor Test</title><meta charset="utf-8"></head>
