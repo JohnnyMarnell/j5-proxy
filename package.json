@@ -47,7 +47,7 @@
     "dev": "bun --hot index.ts",
     "bot-check": "bun run ./bin/bot-check.ts",
     "typecheck": "tsc --noEmit",
-    "build": "bun build --target=node --outdir=dist index.ts api.ts",
+    "build": "bun build --target=node --outdir=dist --external=electron --external=chromium-bidi index.ts api.ts",
     "build:types": "tsc --project tsconfig.build.json",
     "build:all": "bun run build && bun run build:types",
     "build:bin:mac-arm64": "bun build --compile --target=bun-darwin-arm64  --outfile dist/binaries/j5-proxy-mac-arm64   index.ts",
