@@ -24,7 +24,23 @@ export async function closeBrowser(handle: BrowserHandle): Promise<void> {
     else await handle.browser.close().catch(() => {});
 }
 
+function ensureBrowserInstalled() {
+    const execPath = chromium.executablePath();
+    if (!existsSync(execPath)) {
+        consola.warn(`Patchright browser missing at ${execPath}, installing...`);
+        execSync('bunx patchright install chromium', {
+            stdio: 'inherit',
+            cwd: dirname(fileURLToPath(import.meta.url)),
+        });
+        if (!existsSync(execPath)) {
+            throw new Error(`Browser still missing after install: ${execPath}`);
+        }
+        consola.success('Patchright chromium installed.');
+    }
+}
+
 export async function launchBrowser(useChrome = false, initialCookies: any[] = []): Promise<BrowserHandle> {
+    ensureBrowserInstalled();
     if (useChrome) {
         const context = await chromium.launchPersistentContext(CHROME_PROFILE_DIR, {
             channel: 'chrome',
