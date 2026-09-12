@@ -99,10 +99,41 @@ let _pythonCmd: string | null = null;
 let _cookieScriptPath: string | null = null;
 let _cachedCookies: any[] = [];
 let _lastCookieFetch = 0;
+let _unavailableReason: string | null = null;
+let _probeLog: string[] = [];
+let _lastUnavailableWarn = 0;
+let _unauthedCalls = 0;
 
 export interface CookiePrereqResult {
     available: boolean;
     reason?: string;
+    /** The interpreter that won the probe, if any. */
+    pythonCmd?: string;
+    /** One line per candidate tried — what it resolved to and why it was rejected. */
+    probeLog?: string[];
+}
+
+/**
+ * Python interpreters to try, in priority order.
+ *
+ * `$J5_PYTHON` always wins, mirroring `$J5_COOKIE_SCRIPT` for the script path.
+ *
+ * `$VIRTUAL_ENV/bin/python3` comes next and deliberately outranks bare `python3`:
+ * a bare name is only as good as PATH, and PATH is easy to poison. A second venv's
+ * bin prepended after activation leaves `$VIRTUAL_ENV` pointing one place while
+ * `python3` resolves somewhere else entirely — so a `browser-cookie3` installed
+ * into the activated venv is invisible. Asking the activated venv directly is
+ * immune to that.
+ */
+function pythonCandidates(): string[] {
+    const venv = process.env['VIRTUAL_ENV'];
+    return [
+        process.env['J5_PYTHON'],
+        venv ? join(venv, 'bin', 'python3') : null,
+        venv ? join(venv, 'bin', 'python') : null,
+        'python3',
+        'python',
+    ].filter(Boolean) as string[];
 }
 
 /**
@@ -114,21 +145,46 @@ export function checkCookiePrereqs(): CookiePrereqResult {
     _cookieScriptPath = findCookieScript();
 
     _pythonCmd = null;
-    for (const cmd of ['python3', 'python']) {
+    _probeLog = [];
+    for (const cmd of pythonCandidates()) {
+        let resolved = '?';
+        try {
+            resolved = execSync(`${cmd} -c "import sys; print(sys.executable)"`, { stdio: 'pipe' })
+                .toString().trim() || '?';
+        } catch {
+            _probeLog.push(`${cmd} → not runnable`);
+            continue;
+        }
         try {
             execSync(`${cmd} -c "import browser_cookie3"`, { stdio: 'pipe' });
             _pythonCmd = cmd;
+            _probeLog.push(`${cmd} → ${resolved} ✓ browser_cookie3`);
             break;
-        } catch {}
+        } catch {
+            _probeLog.push(`${cmd} → ${resolved} ✗ browser_cookie3 not importable`);
+        }
     }
 
-    const reasons = [
-        !_pythonCmd     ? 'browser_cookie3 not found (pip install browser-cookie3)' : null,
-        !_cookieScriptPath ? 'cookies.py not found (expected alongside the binary, or set J5_COOKIE_SCRIPT)' : null,
-    ].filter(Boolean).join('; ');
+    const reasons: string[] = [];
+    if (!_pythonCmd) {
+        const venv = process.env['VIRTUAL_ENV'];
+        reasons.push(
+            'no python could import browser_cookie3 ' +
+            `[${_probeLog.join(' | ') || 'no candidates'}]` +
+            (venv
+                ? ` — fix: ${join(venv, 'bin', 'pip')} install browser-cookie3, or set J5_PYTHON`
+                : ' — fix: pip install browser-cookie3, or set J5_PYTHON to an interpreter that has it')
+        );
+    }
+    if (!_cookieScriptPath) {
+        reasons.push('cookies.py not found (expected alongside the binary, or set J5_COOKIE_SCRIPT)');
+    }
 
     cookiesAvailable = !!_pythonCmd && !!_cookieScriptPath;
-    return cookiesAvailable ? { available: true } : { available: false, reason: reasons };
+    _unavailableReason = cookiesAvailable ? null : reasons.join('; ');
+    return cookiesAvailable
+        ? { available: true, pythonCmd: _pythonCmd!, probeLog: [..._probeLog] }
+        : { available: false, reason: _unavailableReason!, probeLog: [..._probeLog] };
 }
 
 /**
@@ -146,7 +202,27 @@ export function getCookies(forceRefresh = false, ttl = 3_600_000): any[] {
         );
     }
 
-    if (!cookiesAvailable) return [];
+    if (!cookiesAvailable) {
+        // Returning [] quietly is how this rotted unnoticed: the proxy kept answering 200
+        // while claude.ai answered account_session_invalid, and nothing in the logs joined
+        // the two up. So: shout on the first call, then at most once a minute, carrying a
+        // count of what happened in between. Throttled rather than per-request because an
+        // ERROR line on every request — including the many that never needed a session —
+        // is just training to ignore the line, which is the same failure wearing a hat.
+        _unauthedCalls++;
+        const now = Date.now();
+        if (now - _lastUnavailableWarn > 60_000) {
+            const extra = _unauthedCalls - 1;
+            consola.error(
+                '🍪 NO COOKIES INJECTED — requests go out UNAUTHENTICATED. ' +
+                `Cookie extraction unavailable: ${_unavailableReason ?? 'prereqs never probed (call checkCookiePrereqs)'}` +
+                (extra > 0 ? ` (+${extra} more such request(s) since the last line)` : '')
+            );
+            _lastUnavailableWarn = now;
+            _unauthedCalls = 0;
+        }
+        return [];
+    }
 
     const now = Date.now();
     if (!forceRefresh && _cachedCookies.length > 0 && now - _lastCookieFetch < ttl) {
@@ -165,9 +241,28 @@ export function getCookies(forceRefresh = false, ttl = 3_600_000): any[] {
         return _cachedCookies;
     } catch (err: any) {
         if (forceRefresh) throw err;
-        consola.warn(`🍪 Cookie fetch failed, using stale cache (${_cachedCookies.length} cookies): ${(err as any).message}`);
-        return _cachedCookies; // return stale on silent failure
+        const n = _cachedCookies.length;
+        consola.error(
+            `🍪 Cookie fetch FAILED (${(err as any).message}) — falling back to ${n} stale cookie(s)` +
+            (n === 0 ? ', i.e. NONE: this request goes out UNAUTHENTICATED' : '')
+        );
+        return _cachedCookies;
     }
+}
+
+/** Last probe result, for callers that want to surface it (startup banner, /health, ...). */
+export function cookieDiagnostics(): {
+    available: boolean;
+    reason: string | null;
+    pythonCmd: string | null;
+    probeLog: string[];
+} {
+    return {
+        available: cookiesAvailable,
+        reason: _unavailableReason,
+        pythonCmd: _pythonCmd,
+        probeLog: [..._probeLog],
+    };
 }
 
 // --- COOKIE FILTERING ---
