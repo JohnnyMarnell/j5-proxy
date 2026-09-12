@@ -7,7 +7,7 @@ import { hideBin } from 'yargs/helpers';
 import consola, { type ConsolaReporter, type LogObject } from 'consola';
 import { formatWithOptions } from 'node:util';
 import { appendFileSync } from 'node:fs';
-import notifier from 'node-notifier';
+import { osNotify } from './notify';
 import {
     launchBrowser,
     scrapeWithBrowser,
@@ -116,13 +116,13 @@ function checkPrereqs(): void {
 
 // --- OS NOTIFICATIONS ---
 function notify(title: string, message: string) {
-    notifier.notify({ title, message, sound: false });
+    osNotify({ title, message, sound: false });
 }
 
 function notifyError(reqId: number, status: number, url: string) {
     if (!NOTIFY_ON_ERROR) return;
     const short = url.length > 60 ? url.substring(0, 57) + '…' : url;
-    notifier.notify({ title: `j5-proxy ⚠ ${status}`, message: `[#${reqId}] ${short}`, sound: true });
+    osNotify({ title: `j5-proxy ⚠ ${status}`, message: `[#${reqId}] ${short}`, sound: true });
 }
 
 // --- JSONL LOGGER ---
