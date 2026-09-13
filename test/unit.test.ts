@@ -1,5 +1,6 @@
 import { test, expect, describe } from 'bun:test';
 import { parseProxyOptions, getCacheKey, summarizeBody, stripHopByHop, ResponseCache, validateZyteAuth } from '../lib';
+import { appleScriptString } from '../notify';
 
 // --- validateZyteAuth ---
 
@@ -271,5 +272,42 @@ describe('ResponseCache', () => {
         cache.clear();
         expect(cache.get('k1')).toBeNull();
         expect(cache.get('k2')).toBeNull();
+    });
+});
+
+// --- appleScriptString ---
+// AppleScript string literals have no escape for newlines, and the message can carry
+// arbitrary scraped text, so quoting has to be airtight.
+
+describe('appleScriptString', () => {
+    test('wraps a plain string in quotes', () => {
+        expect(appleScriptString('hello')).toBe('"hello"');
+    });
+
+    test('escapes embedded double quotes', () => {
+        expect(appleScriptString('say "hi"')).toBe('"say \\"hi\\""');
+    });
+
+    test('escapes backslashes before quotes, not after', () => {
+        // a lone trailing backslash must not end up escaping the closing quote
+        expect(appleScriptString('c:\\path\\')).toBe('"c:\\\\path\\\\"');
+    });
+
+    test('flattens newlines, tabs and carriage returns to a single space', () => {
+        expect(appleScriptString('a\nb\r\nc\td')).toBe('"a b c d"');
+    });
+
+    test('strips other control characters', () => {
+        expect(appleScriptString('a\x00b\x1fc\x7fd')).toBe('"abcd"');
+    });
+
+    test('leaves a realistic error message intact', () => {
+        expect(appleScriptString('[#12] https://example.com/a?b=1&c=2')).toBe(
+            '"[#12] https://example.com/a?b=1&c=2"'
+        );
+    });
+
+    test('an all-control-character string collapses to empty quotes, not invalid syntax', () => {
+        expect(appleScriptString('\n\n')).toBe('" "');
     });
 });

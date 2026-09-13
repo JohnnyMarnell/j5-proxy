@@ -21,6 +21,7 @@
     "index.ts",
     "lib.ts",
     "core.ts",
+    "notify.ts",
     "api.ts",
     "cookies.py",
     "README.md",
@@ -66,7 +67,6 @@
   },
   "devDependencies": {
     "@types/bun": "latest",
-    "@types/node-notifier": "^8.0.5",
     "@types/yargs": "^17.0.35",
     "typescript": "^5"
   },
@@ -75,7 +75,6 @@
     "apify-client": "^2.22.1",
     "consola": "^3.4.2",
     "hono": "^4.12.3",
-    "node-notifier": "^10.0.1",
     "patchright": "^1.57.0",
     "yargs": "^18.0.0"
   }
