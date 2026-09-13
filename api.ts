@@ -21,7 +21,6 @@ import {
     closeBrowser,
     scrapeWithBrowser,
     getCookies,
-    cookiesAvailable,
     type ScrapeLoggers,
 } from './core';
 import { parseProxyOptions, ResponseCache, getCacheKey, stripHopByHop } from './lib';
@@ -96,7 +95,7 @@ export async function scrape(url: string, options: ScrapeOptions = {}): Promise<
             : undefined,
     };
 
-    const cookies = options.cookies ?? (cookiesAvailable ? getCookies() : []);
+    const cookies = options.cookies ?? getCookies();
     const handle = await launchBrowser();
     try {
         const output = await scrapeWithBrowser(handle, reqId, startTime, normalizedUrl, proxyOpts, cookies, loggers);
@@ -183,7 +182,7 @@ export async function createProxy(config: ProxyConfig = {}): Promise<ProxyServer
             }
         }
 
-        const cookies = cookiesAvailable ? getCookies(false, cookieTtl) : [];
+        const cookies = getCookies(false, cookieTtl);
 
         try {
             const output = await scrapeWithBrowser(handle, reqId, startTime, targetUrl, proxyOpts, cookies);

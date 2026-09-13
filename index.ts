@@ -13,6 +13,7 @@ import {
     scrapeWithBrowser,
     getCookies,
     checkCookiePrereqs,
+    cookieDiagnostics,
     cookiesAvailable,
     logCleanupError,
     closeBrowser,
@@ -97,14 +98,17 @@ function checkPrereqs(): void {
         consola.warn(`Running on ${process.platform}, not macOS. Chrome cookie extraction will likely fail.`);
     }
 
-    // Cookie prereqs — warn only, never exit (unless --refresh-cookies was explicitly passed)
-    const { available, reason } = checkCookiePrereqs();
-    if (!available) {
-        consola.warn(
-            `Cookie extraction unavailable (${reason}). ` +
-            `Proxy works fine without cookies — pass --refresh-cookies or ` +
-            `X-Proxy-Options: refresh-cookies to force a refresh attempt.`
+    // Cookie prereqs — loud, but never exit (unless --refresh-cookies was explicitly passed)
+    const { available, reason, pythonCmd, probeLog } = checkCookiePrereqs();
+    if (available) {
+        consola.success(`🍪 Cookie extraction ready via ${pythonCmd}`);
+    } else {
+        consola.error(
+            `🍪 COOKIE EXTRACTION UNAVAILABLE — every proxied request will go out ` +
+            `UNAUTHENTICATED, so anything behind a login will 401/403 while the proxy ` +
+            `itself still reports 200.\n   Reason: ${reason}`
         );
+        for (const line of probeLog ?? []) consola.error(`   probe: ${line}`);
     }
 
     // --refresh-cookies: error hard only when the user explicitly asked for it
@@ -326,7 +330,7 @@ app.post('/:version{v\\d+}/extract', async (c) => {
     };
 
     try {
-        const cookies = cookiesAvailable ? getCookies(false, COOKIE_CACHE_TTL) : [];
+        const cookies = getCookies(false, COOKIE_CACHE_TTL);
         if (!browserHandle) {
             return c.json({ type: '/error/internal', title: 'Internal Error', status: 500, detail: 'Browser not initialized' }, 500);
         }
@@ -386,7 +390,7 @@ app.get('/*', async (c) => {
             return c.text(msg, 503);
         }
 
-        const cookies = cookiesAvailable ? getCookies(ctx.proxyOpts.refreshCookies, COOKIE_CACHE_TTL) : [];
+        const cookies = getCookies(ctx.proxyOpts.refreshCookies, COOKIE_CACHE_TTL);
 
         const loggers: ScrapeLoggers = {
             info: (msg) => consola.info(msg),
@@ -446,7 +450,7 @@ checkPrereqs();
 
 async function initBrowser() {
     consola.start(`Booting ${USE_CHROME ? 'Chrome (persistent context)' : 'Chromium'}...`);
-    const initialCookies = USE_CHROME && cookiesAvailable ? getCookies(false, COOKIE_CACHE_TTL) : [];
+    const initialCookies = USE_CHROME ? getCookies(false, COOKIE_CACHE_TTL) : [];
     browserHandle = await launchBrowser(USE_CHROME, initialCookies);
     const cookieNote = USE_CHROME ? ` — ${initialCookies.length} cookie(s) loaded into persistent context` : '';
     consola.ready(`${USE_CHROME ? 'Chrome' : 'Chromium'} ready${cookieNote}.`);
@@ -465,9 +469,17 @@ initBrowser().then(() => {
             `📝 Logging requests to ${LOG_FILE}\n` +
             idleNote + '\n' +
             `⚡ Response throttle: ${THROTTLE_INTERVAL}ms, regex: ${opts.throttleRegex}\n` +
-            `🍪 Cookies: ${cookiesAvailable ? 'available' : 'unavailable (proxy works, but without session cookies)'}`
+            `🍪 Cookies: ${cookiesAvailable
+                ? `available via ${cookieDiagnostics().pythonCmd}`
+                : '⚠ UNAVAILABLE — requests will be UNAUTHENTICATED'}`
         );
         if (STARTUP_NOTIFY) notify('j5-proxy started', `Listening on port ${info.port}`);
+        // This one earns a toast: the proxy usually runs as a background daemon, where a
+        // console warning scrolls past unseen and "works, but unauthenticated" looks
+        // identical to "works" until something downstream quietly 401s.
+        if (!cookiesAvailable) {
+            notify('j5-proxy ⚠ no cookies', 'Requests will be UNAUTHENTICATED — see log for the probe');
+        }
     });
 });
 
